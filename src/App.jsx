@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -581,55 +581,96 @@ function DeleteConfirmModal({ book, onConfirm, onCancel }) {
 }
 
 // ─── PDF Reader ───────────────────────────────────────────────────────────────
+// How many pages above and below the current page to keep rendered.
+// Everything outside this window is replaced by a lightweight placeholder div.
+const PDF_RENDER_BUFFER = 2;
+
 function PDFReader({ book, onClose }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [scale, setScale] = useState(1.2);
   const [loadError, setLoadError] = useState(false);
   const [pdfDark, setPdfDark] = useState(false);
+  // Base page dimensions at scale:1. Fetched from PDF metadata — zero pixels rendered.
+  // Used to give placeholder divs the correct height so the scrollbar stays accurate.
+  const [baseDims, setBaseDims] = useState({ width: 612, height: 792 }); // A4 fallback
+
   const containerRef = useRef(null);
   const pageRefs = useRef({});
+  const ioThrottleRef = useRef(null); // timer handle for IntersectionObserver throttle
 
-  // Close on Escape key
+  // ── Close on Escape ────────────────────────────────────────────────────────
   useEffect(() => {
     const handler = (e) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
 
-  // Intersection observer to track current visible page
+  // ── Throttled IntersectionObserver ─────────────────────────────────────────
+  // Old code fired a React setState on every scroll pixel (11 thresholds × N pages).
+  // Now we use only 5 thresholds and gate callbacks behind a 100ms timer so React
+  // re-renders at most ~10×/sec instead of 60×/sec during fast scrolling.
   useEffect(() => {
     if (!numPages) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        let maxRatio = 0;
-        let visiblePage = currentPage;
-        entries.forEach((entry) => {
-          if (entry.intersectionRatio > maxRatio) {
-            maxRatio = entry.intersectionRatio;
-            visiblePage = Number(entry.target.dataset.page);
-          }
-        });
-        if (maxRatio > 0) setCurrentPage(visiblePage);
+        if (ioThrottleRef.current) return; // already scheduled — drop this batch
+        ioThrottleRef.current = setTimeout(() => {
+          ioThrottleRef.current = null;
+          let maxRatio = 0;
+          let visiblePage = null;
+          entries.forEach((entry) => {
+            if (entry.intersectionRatio > maxRatio) {
+              maxRatio = entry.intersectionRatio;
+              visiblePage = Number(entry.target.dataset.page);
+            }
+          });
+          if (visiblePage !== null && maxRatio > 0) setCurrentPage(visiblePage);
+        }, 100);
       },
-      { root: containerRef.current, threshold: Array.from({ length: 11 }, (_, i) => i / 10) }
+      // 5 thresholds instead of 11 — 54% fewer observer callbacks per scroll tick
+      { root: containerRef.current, threshold: [0, 0.25, 0.5, 0.75, 1.0] }
     );
     Object.values(pageRefs.current).forEach((el) => el && observer.observe(el));
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (ioThrottleRef.current) { clearTimeout(ioThrottleRef.current); ioThrottleRef.current = null; }
+    };
   }, [numPages]);
 
   const scrollToPage = (n) => {
     pageRefs.current[n]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  const onDocumentLoadSuccess = ({ numPages }) => {
-    setNumPages(numPages);
+  const onDocumentLoadSuccess = useCallback(async (pdf) => {
+    setNumPages(pdf.numPages);
     setCurrentPage(1);
-  };
+    // Fetch first-page viewport without rendering any pixels — just geometry.
+    // Gives placeholder divs the right aspect ratio for any PDF, not just A4.
+    try {
+      const firstPage = await pdf.getPage(1);
+      const vp = firstPage.getViewport({ scale: 1 });
+      setBaseDims({ width: vp.width, height: vp.height });
+    } catch { /* keep A4 defaults */ }
+  }, []);
 
-  // Only the PDF page pixels change — the dark shell stays exactly as it was.
-  // invert(1) flips black↔white; hue-rotate(180deg) corrects colour shift so
-  // images look natural rather than psychedelic.
+  // ── Windowed page set ──────────────────────────────────────────────────────
+  // Only pages inside this Set actually mount a <Page> (canvas + text layer).
+  // All other slots are cheap <div> placeholders with fixed dimensions.
+  const renderedPages = useMemo(() => {
+    if (!numPages) return new Set();
+    const start = Math.max(1, currentPage - PDF_RENDER_BUFFER);
+    const end = Math.min(numPages, currentPage + PDF_RENDER_BUFFER);
+    const set = new Set();
+    for (let i = start; i <= end; i++) set.add(i);
+    return set;
+  }, [currentPage, numPages]);
+
+  // Placeholder size — scales correctly whenever the user zooms
+  const placeholderW = Math.round(baseDims.width * scale);
+  const placeholderH = Math.round(baseDims.height * scale);
+
+  // Dark mode filter: only applied to PDF page pixels
   const pageFilter = pdfDark
     ? 'invert(1) hue-rotate(180deg) brightness(0.88) contrast(1.05)'
     : 'none';
@@ -677,7 +718,6 @@ function PDFReader({ book, onClose }) {
 
         {/* Zoom + dark-mode toggle */}
         <div className="flex items-center gap-4">
-          {/* Zoom controls */}
           <div className="flex items-center gap-2">
             <button
               onClick={() => setScale((s) => Math.max(0.5, +(s - 0.2).toFixed(1)))}
@@ -692,62 +732,37 @@ function PDFReader({ book, onClose }) {
             >+</button>
           </div>
 
-          {/* Dark mode pill toggle */}
+          {/* Dark/light pill toggle */}
           <button
             onClick={() => setPdfDark((d) => !d)}
             title={pdfDark ? 'Switch to light mode' : 'Switch to dark mode'}
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '5px 12px 5px 8px',
-              borderRadius: '999px',
-              border: pdfDark ? '1px solid rgba(255,255,255,0.15)' : '1px solid rgba(0,0,0,0.12)',
-              background: pdfDark
-                ? 'linear-gradient(135deg, #1f1c18, #2a2520)'
-                : 'linear-gradient(135deg, #fffdf8, #f5efe6)',
-              color: pdfDark ? '#f5c842' : '#5b4a2e',
-              fontSize: '12px',
-              fontWeight: 600,
-              cursor: 'pointer',
-              transition: 'all 0.3s ease',
-              boxShadow: pdfDark
-                ? '0 0 12px rgba(245,200,66,0.2), inset 0 1px 0 rgba(255,255,255,0.05)'
-                : '0 2px 8px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.8)',
-              letterSpacing: '0.02em',
+              display: 'flex', alignItems: 'center', gap: '6px',
+              padding: '5px 12px 5px 8px', borderRadius: '999px',
+              border: pdfDark ? '1px solid rgba(245,200,66,0.4)' : '1px solid rgba(255,255,255,0.12)',
+              background: pdfDark ? 'rgba(245,200,66,0.12)' : 'rgba(255,255,255,0.07)',
+              color: pdfDark ? '#f5c842' : '#a3a3a3',
+              fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+              transition: 'all 0.25s ease', letterSpacing: '0.02em',
             }}
           >
-            {/* Animated icon */}
-            <span
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: '22px',
-                height: '22px',
-                borderRadius: '50%',
-                background: pdfDark ? 'rgba(245,200,66,0.15)' : 'rgba(91,74,46,0.1)',
-                transition: 'all 0.3s ease',
-                flexShrink: 0,
-              }}
-            >
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              width: '20px', height: '20px', borderRadius: '50%',
+              background: pdfDark ? 'rgba(245,200,66,0.18)' : 'rgba(255,255,255,0.1)',
+              transition: 'all 0.25s ease', flexShrink: 0,
+            }}>
               {pdfDark ? (
-                /* Moon icon */
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" />
                 </svg>
               ) : (
-                /* Sun icon */
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                   <circle cx="12" cy="12" r="5" />
-                  <line x1="12" y1="1" x2="12" y2="3" />
-                  <line x1="12" y1="21" x2="12" y2="23" />
-                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
-                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
-                  <line x1="1" y1="12" x2="3" y2="12" />
-                  <line x1="21" y1="12" x2="23" y2="12" />
-                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
-                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                  <line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" />
+                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                  <line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" />
+                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
                 </svg>
               )}
             </span>
@@ -783,33 +798,49 @@ function PDFReader({ book, onClose }) {
                 </div>
               </div>
             }
-            className="flex flex-col items-center"
+            className="flex flex-col items-center py-4"
           >
-            {numPages &&
-              Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => (
+            {numPages && Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => {
+              const isRendered = renderedPages.has(pageNum);
+              return (
                 <div
                   key={pageNum}
                   ref={(el) => (pageRefs.current[pageNum] = el)}
                   data-page={pageNum}
-                  className="my-4 shadow-2xl"
+                  className="my-4"
                   style={{
-                    // Apply the invert filter to each page wrapper — this flips the
-                    // rendered canvas pixels without re-rendering the PDF.
-                    filter: pageFilter,
-                    transition: 'filter 0.4s ease',
+                    // ─ Windowing ────────────────────────────────────────────────
+                    // Placeholder keeps the exact footprint of a real rendered page
+                    // so the scrollbar length stays accurate for the full document.
+                    width: isRendered ? undefined : `${placeholderW}px`,
+                    height: isRendered ? undefined : `${placeholderH}px`,
+                    // Subtle skeleton tint so the user can see blank "page" slots
+                    background: isRendered ? undefined : 'rgba(255,255,255,0.025)',
                     borderRadius: '2px',
                     overflow: 'hidden',
+                    boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+                    // ─ GPU compositing hint ─────────────────────────────────────
+                    // Promotes each page to its own GPU layer so the browser can
+                    // scroll using the compositor thread — no CPU paint on every frame.
+                    willChange: 'transform',
+                    // ─ Dark mode ────────────────────────────────────────────────
+                    filter: isRendered ? pageFilter : 'none',
+                    transition: 'filter 0.35s ease',
                   }}
                 >
-                  <Page
-                    pageNumber={pageNum}
-                    scale={scale}
-                    renderTextLayer={true}
-                    renderAnnotationLayer={true}
-                    className="block"
-                  />
+                  {/* Only mount the heavy <Page> when inside the render window */}
+                  {isRendered && (
+                    <Page
+                      pageNumber={pageNum}
+                      scale={scale}
+                      renderTextLayer={true}
+                      renderAnnotationLayer={true}
+                      className="block"
+                    />
+                  )}
                 </div>
-              ))}
+              );
+            })}
           </Document>
         )}
       </div>
