@@ -9,42 +9,77 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url,
 ).toString();
 
-// ─── Utility: generate a cover image from first page of PDF ─────────────────
-async function generatePdfCover(file) {
+// ─── Utility: extract PDF metadata + render cover from first page ─────────────
+async function extractPdfMeta(file) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = async (e) => {
       try {
         const loadingTask = pdfjs.getDocument({ data: e.target.result });
         const pdf = await loadingTask.promise;
+
+        // Pull embedded metadata
+        const meta = await pdf.getMetadata().catch(() => ({}));
+        const info = meta?.info ?? {};
+        const metaTitle = typeof info.Title === 'string' ? info.Title.trim() : '';
+        const metaAuthor = typeof info.Author === 'string' ? info.Author.trim() : '';
+
+        // Render first page as cover thumbnail (0.6 scale — plenty for a card thumbnail)
         const page = await pdf.getPage(1);
-        const viewport = page.getViewport({ scale: 1.5 });
+        const viewport = page.getViewport({ scale: 0.6 });
         const canvas = document.createElement('canvas');
         canvas.width = viewport.width;
         canvas.height = viewport.height;
         const ctx = canvas.getContext('2d');
         await page.render({ canvasContext: ctx, viewport }).promise;
-        resolve(canvas.toDataURL('image/jpeg', 0.85));
+        const cover = canvas.toDataURL('image/jpeg', 0.8);
+
+        resolve({ metaTitle, metaAuthor, cover });
       } catch {
-        resolve(null);
+        resolve({ metaTitle: '', metaAuthor: '', cover: null });
       }
     };
     reader.readAsArrayBuffer(file);
   });
 }
 
+// ─── Utility: query Google Books API for book info ────────────────────────────
+async function fetchBookInfo(query) {
+  try {
+    const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=1`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = data.items?.[0];
+    if (!item) return null;
+    const vol = item.volumeInfo;
+    return {
+      title: vol.title?.trim() || '',
+      author: (vol.authors?.[0] ?? '').trim(),
+      cover: vol.imageLinks?.thumbnail?.replace('http:', 'https:') ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Utility: clean filename into a readable title ────────────────────────────
+function titleFromFilename(filename) {
+  return filename
+    .replace(/\.pdf$/i, '')
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim() || 'Untitled Book';
+}
+
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function KindleWoodLibrary() {
   const [activeTab, setActiveTab] = useState('all');
   const [greeting, setGreeting] = useState('Welcome to your cozy reading nook.');
-  const [books, setBooks] = useState([
-    { id: 1, title: 'The Martian', author: 'Andy Weir', favorite: true, cover: 'https://images.unsplash.com/photo-1614728263952-84ea256f9679?q=80&w=400&h=600&fit=crop', pdfUrl: null },
-    { id: 2, title: 'Dune', author: 'Frank Herbert', favorite: false, cover: 'https://images.unsplash.com/photo-1541963463532-d68292c34b19?q=80&w=400&h=600&fit=crop', pdfUrl: null },
-    { id: 3, title: '1984', author: 'George Orwell', favorite: true, cover: 'https://images.unsplash.com/photo-1505664177922-2415531539bf?q=80&w=400&h=600&fit=crop', pdfUrl: null },
-    { id: 4, title: 'Project Hail Mary', author: 'Andy Weir', favorite: false, cover: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=400&h=600&fit=crop', pdfUrl: null },
-  ]);
-  const [openBook, setOpenBook] = useState(null); // book being read
+  const [books, setBooks] = useState([]);
+  const [openBook, setOpenBook] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [pendingBook, setPendingBook] = useState(null); // data waiting for user confirmation
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -60,30 +95,75 @@ export default function KindleWoodLibrary() {
     if (!file || file.type !== 'application/pdf') return;
     setIsUploading(true);
 
-    // Extract a clean title from filename
-    const rawName = file.name.replace(/\.pdf$/i, '');
-    const title = rawName
-      .replace(/[-_]/g, ' ')
-      .replace(/\b\w/g, (c) => c.toUpperCase())
-      .trim() || 'Untitled Book';
+    // Kick off both in parallel: PDF processing and Google Books lookup start at the same time.
+    // The filename-based title is available immediately, so no need to wait for PDF metadata.
+    const fileTitle = titleFromFilename(file.name);
+    const [
+      { metaTitle, metaAuthor, cover: pdfCover },
+      bookInfo,
+    ] = await Promise.all([
+      extractPdfMeta(file),
+      fetchBookInfo(fileTitle),   // start network call right away using filename
+    ]);
 
+    // Compose best-guess data — prefer Google Books, fall back to PDF metadata, then filename
     const pdfUrl = URL.createObjectURL(file);
-    const cover = await generatePdfCover(file);
+    setPendingBook({
+      pdfUrl,
+      cover: bookInfo?.cover || pdfCover,
+      title: bookInfo?.title || metaTitle || fileTitle,
+      author: bookInfo?.author || metaAuthor || '',
+    });
 
+    setIsUploading(false);
+    e.target.value = '';
+  }, []);
+
+  const handleBookConfirm = useCallback(({ title, author }) => {
+    if (!pendingBook) return;
     setBooks((prev) => [
       ...prev,
       {
         id: Date.now(),
-        title,
-        author: 'Unknown Author',
+        title: title.trim() || 'Untitled Book',
+        author: author.trim() || 'Unknown Author',
         favorite: false,
-        cover,
-        pdfUrl,
+        cover: pendingBook.cover,
+        pdfUrl: pendingBook.pdfUrl,
       },
     ]);
-    setIsUploading(false);
-    // Reset input so same file can be re-uploaded
-    e.target.value = '';
+    setPendingBook(null);
+  }, [pendingBook]);
+
+  const handleBookCancel = useCallback(() => {
+    if (pendingBook?.pdfUrl) URL.revokeObjectURL(pendingBook.pdfUrl);
+    setPendingBook(null);
+  }, [pendingBook]);
+
+  const toggleFavorite = useCallback((id) => {
+    setBooks((prev) =>
+      prev.map((b) => (b.id === id ? { ...b, favorite: !b.favorite } : b))
+    );
+  }, []);
+
+  const [bookToDelete, setBookToDelete] = useState(null);
+
+  const handleDeleteRequest = useCallback((book) => {
+    setBookToDelete(book);
+  }, []);
+
+  const handleDeleteConfirm = useCallback(() => {
+    if (!bookToDelete) return;
+    // Free the blob URL so memory isn't leaked
+    if (bookToDelete.pdfUrl) URL.revokeObjectURL(bookToDelete.pdfUrl);
+    setBooks((prev) => prev.filter((b) => b.id !== bookToDelete.id));
+    // Close reader if this book was open
+    setOpenBook((cur) => (cur?.id === bookToDelete.id ? null : cur));
+    setBookToDelete(null);
+  }, [bookToDelete]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setBookToDelete(null);
   }, []);
 
   const displayedBooks =
@@ -91,6 +171,24 @@ export default function KindleWoodLibrary() {
 
   return (
     <>
+      {/* ── Book Info Confirmation Modal ───────────────────────────── */}
+      {pendingBook && (
+        <BookInfoModal
+          initialData={pendingBook}
+          onConfirm={handleBookConfirm}
+          onCancel={handleBookCancel}
+        />
+      )}
+
+      {/* ── Delete Confirmation Modal ──────────────────────────────── */}
+      {bookToDelete && (
+        <DeleteConfirmModal
+          book={bookToDelete}
+          onConfirm={handleDeleteConfirm}
+          onCancel={handleDeleteCancel}
+        />
+      )}
+
       {/* ── PDF Reader Overlay ─────────────────────────────────────── */}
       {openBook && (
         <PDFReader book={openBook} onClose={() => setOpenBook(null)} />
@@ -116,8 +214,8 @@ export default function KindleWoodLibrary() {
                   key={tab}
                   onClick={() => setActiveTab(tab)}
                   className={`px-4 py-2 rounded-full text-sm font-medium transition-all duration-300 ${activeTab === tab
-                      ? 'bg-neutral-800 text-white dark:bg-neutral-200 dark:text-black shadow-md'
-                      : 'text-neutral-500 hover:bg-neutral-200 dark:hover:bg-neutral-800'
+                    ? 'bg-neutral-800 text-white dark:bg-neutral-200 dark:text-black shadow-md'
+                    : 'text-neutral-500 hover:bg-neutral-200 dark:hover:bg-neutral-800'
                     }`}
                 >
                   {tab === 'all' ? 'All Books' : 'Favorites'}
@@ -133,6 +231,8 @@ export default function KindleWoodLibrary() {
                 key={book.id}
                 book={book}
                 onClick={() => book.pdfUrl && setOpenBook(book)}
+                onToggleFavorite={toggleFavorite}
+                onDelete={handleDeleteRequest}
               />
             ))}
           </div>
@@ -150,7 +250,7 @@ export default function KindleWoodLibrary() {
         {/* Floating "Add Book" button */}
         <button
           onClick={() => fileInputRef.current?.click()}
-          disabled={isUploading}
+          disabled={isUploading || !!pendingBook}
           className="fixed bottom-10 right-10 z-50 group flex items-center justify-center w-16 h-16 bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 rounded-full shadow-2xl hover:w-44 transition-all duration-300 overflow-hidden active:scale-90 cursor-pointer border border-neutral-800 dark:border-neutral-200 disabled:opacity-60"
           title="Upload a PDF"
         >
@@ -173,24 +273,53 @@ export default function KindleWoodLibrary() {
 }
 
 // ─── BookCard ────────────────────────────────────────────────────────────────
-function BookCard({ book, onClick }) {
+function BookCard({ book, onClick, onToggleFavorite, onDelete }) {
   const hasPdf = !!book.pdfUrl;
   return (
     <div
       onClick={onClick}
       className={`group flex flex-col transition-transform duration-300 hover:-translate-y-2 relative ${hasPdf ? 'cursor-pointer' : 'cursor-default'}`}
     >
-      {book.favorite && (
-        <div className="absolute top-4 right-4 z-20 bg-white/80 dark:bg-black/80 backdrop-blur-md p-2 rounded-full shadow-sm">
-          <span className="text-red-500 text-xs">❤️</span>
-        </div>
-      )}
+      {/* ── Heart toggle — top-left, always visible ── */}
+      <button
+        onClick={(e) => { e.stopPropagation(); onToggleFavorite(book.id); }}
+        className={`absolute top-3 left-3 z-20 p-1.5 rounded-full backdrop-blur-md shadow-sm transition-all duration-200 ${book.favorite
+          ? 'bg-red-500/20 text-red-500 scale-110'
+          : 'bg-white/70 dark:bg-black/60 text-neutral-400 hover:text-red-400 hover:bg-red-500/10'
+          }`}
+        title={book.favorite ? 'Remove from favorites' : 'Add to favorites'}
+      >
+        <svg
+          width="14" height="14" viewBox="0 0 24 24"
+          fill={book.favorite ? 'currentColor' : 'none'}
+          stroke="currentColor" strokeWidth="2"
+          strokeLinecap="round" strokeLinejoin="round"
+          style={{ transition: 'fill 0.2s ease' }}
+        >
+          <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+        </svg>
+      </button>
 
+      {/* ── PDF badge — top-right ── */}
       {hasPdf && (
-        <div className="absolute top-4 left-4 z-20 bg-amber-600/90 backdrop-blur-md px-2 py-0.5 rounded-full shadow-sm">
+        <div className="absolute top-3 right-3 z-20 bg-amber-600/90 backdrop-blur-md px-2 py-0.5 rounded-full shadow-sm">
           <span className="text-white text-[10px] font-semibold tracking-wide">PDF</span>
         </div>
       )}
+
+      {/* ── Trash button — bottom-right, appears on hover ── */}
+      <button
+        onClick={(e) => { e.stopPropagation(); onDelete(book); }}
+        className="absolute bottom-[4.5rem] right-3 z-20 p-1.5 rounded-full bg-white/70 dark:bg-black/60 backdrop-blur-md shadow-sm text-neutral-400 hover:text-red-500 hover:bg-red-500/10 transition-all duration-200 opacity-0 group-hover:opacity-100 scale-90 group-hover:scale-100"
+        title="Remove from library"
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="3 6 5 6 21 6" />
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+          <path d="M10 11v6M14 11v6" />
+          <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+        </svg>
+      </button>
 
       <div className="w-full aspect-[2/3] rounded-2xl bg-white/40 dark:bg-black/40 backdrop-blur-md shadow-md overflow-hidden z-10">
         {book.cover ? (
@@ -244,12 +373,220 @@ function DefaultCover({ title }) {
   );
 }
 
+// ─── Book Info Confirmation Modal ─────────────────────────────────────────────
+function BookInfoModal({ initialData, onConfirm, onCancel }) {
+  const [title, setTitle] = useState(initialData.title);
+  const [author, setAuthor] = useState(initialData.author);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onConfirm({ title, author });
+  };
+
+  // Close on backdrop click
+  const handleBackdropClick = (e) => {
+    if (e.target === e.currentTarget) onCancel();
+  };
+
+  return (
+    <div
+      onClick={handleBackdropClick}
+      className="fixed inset-0 z-[200] flex items-center justify-center p-6"
+      style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)' }}
+    >
+      <div
+        className="relative w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl"
+        style={{ background: 'linear-gradient(135deg, #1c1a17 0%, #252320 100%)', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Amber glow top */}
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-72 h-32 rounded-full blur-[60px] pointer-events-none"
+          style={{ background: 'rgba(217,119,6,0.15)' }} />
+
+        <div className="relative z-10 p-8">
+          {/* Header */}
+          <div className="flex items-start justify-between mb-7">
+            <div>
+              <h2 className="text-white font-serif text-xl font-bold leading-tight">Confirm Book Details</h2>
+              <p className="text-neutral-500 text-xs mt-1">We found this info automatically — review and edit if needed.</p>
+            </div>
+            <button
+              onClick={onCancel}
+              className="text-neutral-600 hover:text-white transition-colors p-1.5 rounded-full hover:bg-white/10 ml-4 shrink-0"
+              title="Cancel"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <div className="flex gap-6">
+            {/* Cover preview */}
+            <div className="shrink-0 w-28 aspect-[2/3] rounded-xl overflow-hidden shadow-lg border border-white/10">
+              {initialData.cover ? (
+                <img
+                  src={initialData.cover}
+                  alt="Cover preview"
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <div
+                  className="w-full h-full flex items-center justify-center p-2"
+                  style={{ background: 'linear-gradient(135deg, #2d1b69, #11998e)' }}
+                >
+                  <span className="text-white text-center text-xs font-serif font-semibold leading-snug opacity-90">
+                    {title || 'No Cover'}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSubmit} className="flex-1 flex flex-col gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-neutral-400 tracking-wider uppercase mb-1.5">
+                  Book Title
+                </label>
+                <input
+                  type="text"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder="Enter book title…"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white text-sm placeholder-neutral-600 focus:outline-none focus:border-amber-500/60 focus:bg-white/8 transition-all duration-200"
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-neutral-400 tracking-wider uppercase mb-1.5">
+                  Author
+                </label>
+                <input
+                  type="text"
+                  value={author}
+                  onChange={(e) => setAuthor(e.target.value)}
+                  placeholder="Enter author name…"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white text-sm placeholder-neutral-600 focus:outline-none focus:border-amber-500/60 focus:bg-white/8 transition-all duration-200"
+                />
+              </div>
+
+              <div className="flex gap-3 mt-1">
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="flex-1 py-2.5 rounded-xl text-sm font-medium text-neutral-400 hover:text-white border border-white/10 hover:border-white/20 hover:bg-white/5 transition-all duration-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-all duration-200 hover:opacity-90 active:scale-95"
+                  style={{ background: 'linear-gradient(135deg, #d97706, #b45309)' }}
+                >
+                  Add to Library
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Delete Confirmation Modal ────────────────────────────────────────────────
+function DeleteConfirmModal({ book, onConfirm, onCancel }) {
+  // Close on backdrop click
+  const handleBackdropClick = (e) => {
+    if (e.target === e.currentTarget) onCancel();
+  };
+
+  // Close on Escape key
+  useEffect(() => {
+    const handler = (e) => { if (e.key === 'Escape') onCancel(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onCancel]);
+
+  return (
+    <div
+      onClick={handleBackdropClick}
+      className="fixed inset-0 z-[200] flex items-center justify-center p-6"
+      style={{ background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)' }}
+    >
+      <div
+        className="relative w-full max-w-sm rounded-3xl overflow-hidden shadow-2xl"
+        style={{ background: 'linear-gradient(135deg, #1c1a17 0%, #252320 100%)', border: '1px solid rgba(255,255,255,0.08)' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Red glow */}
+        <div
+          className="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-24 rounded-full blur-[50px] pointer-events-none"
+          style={{ background: 'rgba(239,68,68,0.12)' }}
+        />
+
+        <div className="relative z-10 p-7">
+          {/* Icon + heading */}
+          <div className="flex items-center gap-3 mb-5">
+            <div className="p-2.5 rounded-full bg-red-500/15 text-red-400">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                <path d="M10 11v6M14 11v6" />
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+              </svg>
+            </div>
+            <div>
+              <h2 className="text-white font-serif text-lg font-bold leading-tight">Remove Book?</h2>
+              <p className="text-neutral-500 text-xs mt-0.5">This can't be undone.</p>
+            </div>
+          </div>
+
+          {/* Book preview row */}
+          <div className="flex items-center gap-4 p-3 rounded-2xl mb-6" style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <div className="w-10 aspect-[2/3] rounded-lg overflow-hidden shrink-0 shadow-md">
+              {book.cover ? (
+                <img src={book.cover} alt={book.title} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full" style={{ background: 'linear-gradient(135deg, #2d1b69, #11998e)' }} />
+              )}
+            </div>
+            <div className="min-w-0">
+              <p className="text-white text-sm font-semibold truncate">{book.title}</p>
+              <p className="text-neutral-500 text-xs truncate">{book.author}</p>
+            </div>
+          </div>
+
+          {/* Actions */}
+          <div className="flex gap-3">
+            <button
+              onClick={onCancel}
+              className="flex-1 py-2.5 rounded-xl text-sm font-medium text-neutral-400 hover:text-white border border-white/10 hover:border-white/20 hover:bg-white/5 transition-all duration-200"
+            >
+              Keep it
+            </button>
+            <button
+              onClick={onConfirm}
+              className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-all duration-200 hover:opacity-90 active:scale-95"
+              style={{ background: 'linear-gradient(135deg, #dc2626, #991b1b)' }}
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── PDF Reader ───────────────────────────────────────────────────────────────
 function PDFReader({ book, onClose }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [scale, setScale] = useState(1.2);
   const [loadError, setLoadError] = useState(false);
+  const [pdfDark, setPdfDark] = useState(false);
   const containerRef = useRef(null);
   const pageRefs = useRef({});
 
@@ -289,6 +626,13 @@ function PDFReader({ book, onClose }) {
     setNumPages(numPages);
     setCurrentPage(1);
   };
+
+  // Only the PDF page pixels change — the dark shell stays exactly as it was.
+  // invert(1) flips black↔white; hue-rotate(180deg) corrects colour shift so
+  // images look natural rather than psychedelic.
+  const pageFilter = pdfDark
+    ? 'invert(1) hue-rotate(180deg) brightness(0.88) contrast(1.05)'
+    : 'none';
 
   return (
     <div className="fixed inset-0 z-[100] flex flex-col bg-[#1a1814]" style={{ fontFamily: 'system-ui, sans-serif' }}>
@@ -331,19 +675,84 @@ function PDFReader({ book, onClose }) {
           </button>
         </div>
 
-        {/* Zoom controls */}
-        <div className="flex items-center gap-2">
+        {/* Zoom + dark-mode toggle */}
+        <div className="flex items-center gap-4">
+          {/* Zoom controls */}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setScale((s) => Math.max(0.5, +(s - 0.2).toFixed(1)))}
+              className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
+              title="Zoom out"
+            >−</button>
+            <span className="text-neutral-300 text-xs w-10 text-center">{Math.round(scale * 100)}%</span>
+            <button
+              onClick={() => setScale((s) => Math.min(3, +(s + 0.2).toFixed(1)))}
+              className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
+              title="Zoom in"
+            >+</button>
+          </div>
+
+          {/* Dark mode pill toggle */}
           <button
-            onClick={() => setScale((s) => Math.max(0.5, +(s - 0.2).toFixed(1)))}
-            className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
-            title="Zoom out"
-          >−</button>
-          <span className="text-neutral-300 text-xs w-10 text-center">{Math.round(scale * 100)}%</span>
-          <button
-            onClick={() => setScale((s) => Math.min(3, +(s + 0.2).toFixed(1)))}
-            className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
-            title="Zoom in"
-          >+</button>
+            onClick={() => setPdfDark((d) => !d)}
+            title={pdfDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '5px 12px 5px 8px',
+              borderRadius: '999px',
+              border: pdfDark ? '1px solid rgba(255,255,255,0.15)' : '1px solid rgba(0,0,0,0.12)',
+              background: pdfDark
+                ? 'linear-gradient(135deg, #1f1c18, #2a2520)'
+                : 'linear-gradient(135deg, #fffdf8, #f5efe6)',
+              color: pdfDark ? '#f5c842' : '#5b4a2e',
+              fontSize: '12px',
+              fontWeight: 600,
+              cursor: 'pointer',
+              transition: 'all 0.3s ease',
+              boxShadow: pdfDark
+                ? '0 0 12px rgba(245,200,66,0.2), inset 0 1px 0 rgba(255,255,255,0.05)'
+                : '0 2px 8px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.8)',
+              letterSpacing: '0.02em',
+            }}
+          >
+            {/* Animated icon */}
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '22px',
+                height: '22px',
+                borderRadius: '50%',
+                background: pdfDark ? 'rgba(245,200,66,0.15)' : 'rgba(91,74,46,0.1)',
+                transition: 'all 0.3s ease',
+                flexShrink: 0,
+              }}
+            >
+              {pdfDark ? (
+                /* Moon icon */
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" />
+                </svg>
+              ) : (
+                /* Sun icon */
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <circle cx="12" cy="12" r="5" />
+                  <line x1="12" y1="1" x2="12" y2="3" />
+                  <line x1="12" y1="21" x2="12" y2="23" />
+                  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+                  <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+                  <line x1="1" y1="12" x2="3" y2="12" />
+                  <line x1="21" y1="12" x2="23" y2="12" />
+                  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+                  <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                </svg>
+              )}
+            </span>
+            {pdfDark ? 'Dark' : 'Light'}
+          </button>
         </div>
       </div>
 
@@ -383,6 +792,14 @@ function PDFReader({ book, onClose }) {
                   ref={(el) => (pageRefs.current[pageNum] = el)}
                   data-page={pageNum}
                   className="my-4 shadow-2xl"
+                  style={{
+                    // Apply the invert filter to each page wrapper — this flips the
+                    // rendered canvas pixels without re-rendering the PDF.
+                    filter: pageFilter,
+                    transition: 'filter 0.4s ease',
+                    borderRadius: '2px',
+                    overflow: 'hidden',
+                  }}
                 >
                   <Page
                     pageNumber={pageNum}
