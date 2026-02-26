@@ -82,6 +82,20 @@ export default function KindleWoodLibrary() {
   const [pendingBook, setPendingBook] = useState(null); // data waiting for user confirmation
   const fileInputRef = useRef(null);
 
+  // ── Bookmarks: { [bookId]: number[] } persisted in localStorage ──────────────
+  const [bookmarks, setBookmarks] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('kw_bookmarks') || '{}'); }
+    catch { return {}; }
+  });
+
+  const updateBookmarks = useCallback((bookId, updater) => {
+    setBookmarks((prev) => {
+      const next = { ...prev, [bookId]: updater(prev[bookId] || []) };
+      localStorage.setItem('kw_bookmarks', JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     const hour = new Date().getHours();
     if (hour < 12) setGreeting('Good morning. Coffee and a book?');
@@ -191,7 +205,12 @@ export default function KindleWoodLibrary() {
 
       {/* ── PDF Reader Overlay ─────────────────────────────────────── */}
       {openBook && (
-        <PDFReader book={openBook} onClose={() => setOpenBook(null)} />
+        <PDFReader
+          book={openBook}
+          onClose={() => setOpenBook(null)}
+          bookmarks={bookmarks[openBook.id] || []}
+          onUpdateBookmarks={(updater) => updateBookmarks(openBook.id, updater)}
+        />
       )}
 
       {/* ── Main Library Page ──────────────────────────────────────── */}
@@ -585,12 +604,13 @@ function DeleteConfirmModal({ book, onConfirm, onCancel }) {
 // Everything outside this window is replaced by a lightweight placeholder div.
 const PDF_RENDER_BUFFER = 2;
 
-function PDFReader({ book, onClose }) {
+function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [scale, setScale] = useState(1.2);
   const [loadError, setLoadError] = useState(false);
   const [pdfDark, setPdfDark] = useState(false);
+  const [bookmarkPanelOpen, setBookmarkPanelOpen] = useState(false);
   // Base page dimensions at scale:1. Fetched from PDF metadata — zero pixels rendered.
   // Used to give placeholder divs the correct height so the scrollbar stays accurate.
   const [baseDims, setBaseDims] = useState({ width: 612, height: 792 }); // A4 fallback
@@ -598,6 +618,21 @@ function PDFReader({ book, onClose }) {
   const containerRef = useRef(null);
   const pageRefs = useRef({});
   const ioThrottleRef = useRef(null); // timer handle for IntersectionObserver throttle
+  const ratioMapRef = useRef({}); // persistent map: { [pageNumber]: intersectionRatio }
+
+  const isCurrentPageBookmarked = bookmarks.includes(currentPage);
+
+  const toggleBookmark = () => {
+    onUpdateBookmarks((prev) =>
+      prev.includes(currentPage)
+        ? prev.filter((p) => p !== currentPage)
+        : [...prev, currentPage].sort((a, b) => a - b)
+    );
+  };
+
+  const removeBookmark = (page) => {
+    onUpdateBookmarks((prev) => prev.filter((p) => p !== page));
+  };
 
   // ── Close on Escape ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -606,30 +641,40 @@ function PDFReader({ book, onClose }) {
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
 
-  // ── Throttled IntersectionObserver ─────────────────────────────────────────
-  // Old code fired a React setState on every scroll pixel (11 thresholds × N pages).
-  // Now we use only 5 thresholds and gate callbacks behind a 100ms timer so React
-  // re-renders at most ~10×/sec instead of 60×/sec during fast scrolling.
+  // ── Stable IntersectionObserver with persistent ratio map ─────────────────
+  // Fix for page-number flicker: instead of scanning only the *changed* entries
+  // (which caused 4↔5 oscillation mid-scroll), we maintain a persistent map of
+  // every page's latest ratio. The current page only shifts when a candidate
+  // page holds >60% of the viewport — the "majority wins" rule.
   useEffect(() => {
     if (!numPages) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (ioThrottleRef.current) return; // already scheduled — drop this batch
+        // 1. Update the persistent ratio map with whatever just changed
+        entries.forEach((entry) => {
+          ratioMapRef.current[entry.target.dataset.page] = entry.intersectionRatio;
+        });
+
+        // 2. Throttle the React setState so we render at most ~10×/sec
+        if (ioThrottleRef.current) return;
         ioThrottleRef.current = setTimeout(() => {
           ioThrottleRef.current = null;
-          let maxRatio = 0;
-          let visiblePage = null;
-          entries.forEach((entry) => {
-            if (entry.intersectionRatio > maxRatio) {
-              maxRatio = entry.intersectionRatio;
-              visiblePage = Number(entry.target.dataset.page);
-            }
+
+          // 3. Scan the FULL map to find the page with the highest visibility
+          let bestPage = null;
+          let bestRatio = 0;
+          Object.entries(ratioMapRef.current).forEach(([page, ratio]) => {
+            if (ratio > bestRatio) { bestRatio = ratio; bestPage = Number(page); }
           });
-          if (visiblePage !== null && maxRatio > 0) setCurrentPage(visiblePage);
+
+          // 4. Only commit if the winner has >60% of the viewport
+          //    (prevents flickering when two pages share roughly equal screen space)
+          if (bestPage !== null && bestRatio > 0.6) {
+            setCurrentPage(bestPage);
+          }
         }, 100);
       },
-      // 5 thresholds instead of 11 — 54% fewer observer callbacks per scroll tick
-      { root: containerRef.current, threshold: [0, 0.25, 0.5, 0.75, 1.0] }
+      { root: containerRef.current, threshold: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] }
     );
     Object.values(pageRefs.current).forEach((el) => el && observer.observe(el));
     return () => {
@@ -854,6 +899,265 @@ function PDFReader({ book, onClose }) {
           />
         </div>
       )}
+
+      {/* ── Bookmark Panel (slide-in from right) ── */}
+      {bookmarkPanelOpen && (
+        <div
+          style={{ position: 'fixed', top: '58px', left: 0, right: 0, bottom: 0, zIndex: 110 }}
+          onClick={() => setBookmarkPanelOpen(false)}
+        >
+          <div
+            style={{
+              position: 'absolute', right: 0, top: 0, bottom: 0, width: '288px',
+              display: 'flex', flexDirection: 'column',
+              background: 'linear-gradient(160deg, #1a1612 0%, #211e18 100%)',
+              borderLeft: '1px solid rgba(255,255,255,0.08)',
+              boxShadow: '-12px 0 40px rgba(0,0,0,0.6)',
+              animation: 'slideInRight 0.25s cubic-bezier(0.22,1,0.36,1)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Panel header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/8 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                </svg>
+                <span style={{ color: '#e5e0d5', fontWeight: 600, fontSize: '14px', letterSpacing: '0.01em' }}>Bookmarks</span>
+                {bookmarks.length > 0 && (
+                  <span style={{
+                    background: 'rgba(245,158,11,0.18)', color: '#f59e0b',
+                    borderRadius: '999px', fontSize: '11px', fontWeight: 700,
+                    padding: '1px 7px', border: '1px solid rgba(245,158,11,0.3)',
+                  }}>{bookmarks.length}</span>
+                )}
+              </div>
+              <button
+                onClick={() => setBookmarkPanelOpen(false)}
+                style={{ color: '#6b6b6b', padding: '4px', borderRadius: '6px', cursor: 'pointer' }}
+                className="hover:text-white hover:bg-white/10 transition-colors"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Bookmark list */}
+            <div className="flex-1 overflow-y-auto py-3 px-3" style={{ scrollbarWidth: 'thin', scrollbarColor: '#333 transparent' }}>
+              {bookmarks.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-center px-4 gap-3">
+                  <div style={{
+                    width: '48px', height: '48px', borderRadius: '14px',
+                    background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.15)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                      <line x1="12" y1="8" x2="12" y2="14" />
+                      <line x1="9" y1="11" x2="15" y2="11" />
+                    </svg>
+                  </div>
+                  <p style={{ color: '#5a5650', fontSize: '13px', lineHeight: 1.5 }}>
+                    No bookmarks yet.<br />Navigate to a page and press the ribbon button.
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {bookmarks.map((page) => (
+                    <div
+                      key={page}
+                      className="group flex items-center gap-3 rounded-xl px-3 py-2.5 cursor-pointer transition-all duration-150"
+                      style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.05)' }}
+                      onClick={() => { scrollToPage(page); setBookmarkPanelOpen(false); }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(245,158,11,0.08)'}
+                      onMouseLeave={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.03)'}
+                    >
+                      {/* Ribbon icon */}
+                      <div style={{
+                        width: '30px', height: '30px', borderRadius: '8px', flexShrink: 0,
+                        background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.2)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="#f59e0b" stroke="none">
+                          <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                        </svg>
+                      </div>
+                      {/* Label */}
+                      <div className="flex-1 min-w-0">
+                        <p style={{ color: '#d4cfca', fontSize: '13px', fontWeight: 600 }}>Page {page}</p>
+                        <p style={{ color: '#4a4742', fontSize: '11px' }}>{numPages ? `of ${numPages}` : ''}</p>
+                      </div>
+                      {/* Jump arrow */}
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2.5" strokeLinecap="round"
+                        style={{ opacity: 0.6, flexShrink: 0 }}>
+                        <path d="M5 12h14M12 5l7 7-7 7" />
+                      </svg>
+                      {/* Delete button */}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); removeBookmark(page); }}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Remove bookmark"
+                        style={{ color: '#6b6b6b', padding: '3px', borderRadius: '5px', cursor: 'pointer', flexShrink: 0 }}
+                        onMouseEnter={(e) => e.currentTarget.style.color = '#ef4444'}
+                        onMouseLeave={(e) => e.currentTarget.style.color = '#6b6b6b'}
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                          <path d="M18 6L6 18M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Current page quick-add footer */}
+            <div className="px-4 py-3 border-t shrink-0" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+              <button
+                onClick={toggleBookmark}
+                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 active:scale-95"
+                style={isCurrentPageBookmarked ? {
+                  background: 'rgba(239,68,68,0.1)', color: '#f87171',
+                  border: '1px solid rgba(239,68,68,0.25)',
+                } : {
+                  background: 'rgba(245,158,11,0.12)', color: '#f59e0b',
+                  border: '1px solid rgba(245,158,11,0.25)',
+                }}
+              >
+                {isCurrentPageBookmarked ? (
+                  <>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                    </svg>
+                    Remove Page {currentPage}
+                  </>
+                ) : (
+                  <>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                      <line x1="12" y1="8" x2="12" y2="14" />
+                      <line x1="9" y1="11" x2="15" y2="11" />
+                    </svg>
+                    Bookmark Page {currentPage}
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Floating Bookmark Button ── */}
+      {numPages && (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: '28px',
+            right: '28px',
+            zIndex: 105,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'flex-end',
+            gap: '10px',
+          }}
+        >
+          {/* Mini bookmark count pill — shown when there are bookmarks */}
+          {bookmarks.length > 0 && !bookmarkPanelOpen && (
+            <button
+              onClick={() => setBookmarkPanelOpen(true)}
+              title="Open bookmarks"
+              style={{
+                display: 'flex', alignItems: 'center', gap: '6px',
+                padding: '5px 10px 5px 8px', borderRadius: '999px',
+                background: 'rgba(26,22,18,0.92)', backdropFilter: 'blur(10px)',
+                border: '1px solid rgba(245,158,11,0.3)',
+                color: '#f59e0b', fontSize: '12px', fontWeight: 700,
+                cursor: 'pointer', boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+                transition: 'all 0.2s ease',
+                animation: 'floatUp 0.3s cubic-bezier(0.22,1,0.36,1)',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(245,158,11,0.15)'; e.currentTarget.style.borderColor = 'rgba(245,158,11,0.5)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(26,22,18,0.92)'; e.currentTarget.style.borderColor = 'rgba(245,158,11,0.3)'; }}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="#f59e0b" stroke="none">
+                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+              </svg>
+              {bookmarks.length} {bookmarks.length === 1 ? 'bookmark' : 'bookmarks'}
+            </button>
+          )}
+
+          {/* Main ribbon FAB */}
+          <button
+            onClick={toggleBookmark}
+            onContextMenu={(e) => { e.preventDefault(); setBookmarkPanelOpen(true); }}
+            title={isCurrentPageBookmarked ? `Remove bookmark (p.${currentPage}) · Right-click to manage` : `Bookmark page ${currentPage} · Right-click to manage`}
+            style={{
+              width: '50px',
+              height: '60px',
+              borderRadius: '10px 10px 4px 4px',
+              border: 'none',
+              cursor: 'pointer',
+              position: 'relative',
+              overflow: 'hidden',
+              boxShadow: isCurrentPageBookmarked
+                ? '0 6px 28px rgba(245,158,11,0.45), 0 2px 8px rgba(0,0,0,0.6)'
+                : '0 6px 24px rgba(0,0,0,0.5)',
+              transition: 'all 0.25s cubic-bezier(0.34,1.56,0.64,1)',
+              background: isCurrentPageBookmarked
+                ? 'linear-gradient(160deg,#f59e0b,#d97706)'
+                : 'linear-gradient(160deg,#2a2520,#1a1612)',
+              transform: 'translateY(0)',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-3px) scale(1.05)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0) scale(1)'; }}
+            onMouseDown={(e) => { e.currentTarget.style.transform = 'translateY(1px) scale(0.96)'; }}
+            onMouseUp={(e) => { e.currentTarget.style.transform = 'translateY(-3px) scale(1.05)'; }}
+          >
+            {/* Ribbon notch at the bottom */}
+            <div style={{
+              position: 'absolute', bottom: 0, left: 0, right: 0, height: '16px',
+              background: isCurrentPageBookmarked ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.04)',
+              clipPath: 'polygon(0 0, 50% 55%, 100% 0, 100% 100%, 0 100%)',
+            }} />
+            {/* Icon */}
+            <div style={{
+              position: 'absolute', inset: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              paddingBottom: '6px',
+            }}>
+              {isCurrentPageBookmarked ? (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="white" stroke="none">
+                  <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                </svg>
+              ) : (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+                  <line x1="12" y1="8" x2="12" y2="14" />
+                  <line x1="9" y1="11" x2="15" y2="11" />
+                </svg>
+              )}
+            </div>
+            {/* Border overlay */}
+            <div style={{
+              position: 'absolute', inset: 0, borderRadius: 'inherit',
+              border: isCurrentPageBookmarked ? '1px solid rgba(255,255,255,0.2)' : '1px solid rgba(245,158,11,0.25)',
+              pointerEvents: 'none',
+            }} />
+          </button>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes slideInRight {
+          from { transform: translateX(100%); opacity: 0; }
+          to   { transform: translateX(0);    opacity: 1; }
+        }
+        @keyframes floatUp {
+          from { transform: translateY(10px); opacity: 0; }
+          to   { transform: translateY(0);    opacity: 1; }
+        }
+      `}</style>
     </div>
   );
 }
