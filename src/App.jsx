@@ -161,6 +161,7 @@ export default function KindleWoodLibrary() {
   }, []);
 
   const [bookToDelete, setBookToDelete] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const handleDeleteRequest = useCallback((book) => {
     setBookToDelete(book);
@@ -180,8 +181,13 @@ export default function KindleWoodLibrary() {
     setBookToDelete(null);
   }, []);
 
-  const displayedBooks =
-    activeTab === 'favorites' ? books.filter((b) => b.favorite) : books;
+  const tabFiltered = activeTab === 'favorites' ? books.filter((b) => b.favorite) : books;
+  const displayedBooks = searchQuery.trim()
+    ? tabFiltered.filter((b) =>
+      b.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      b.author.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    : tabFiltered;
 
   return (
     <>
@@ -220,12 +226,87 @@ export default function KindleWoodLibrary() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[600px] h-[600px] bg-orange-400/20 dark:bg-orange-900/20 rounded-full blur-[150px] pointer-events-none z-0" />
 
         <div className="relative z-10">
-          {/* Header */}
+          {/* Header row: title left, search right */}
           <header className="mb-12 max-w-7xl mx-auto">
-            <h1 className="text-5xl font-serif tracking-tight text-neutral-800 dark:text-neutral-100">
-              KindleWood
-            </h1>
-            <p className="text-lg text-neutral-500 dark:text-neutral-400 mt-2">{greeting}</p>
+            <div className="flex items-start justify-between gap-8">
+              {/* Left: title + greeting */}
+              <div className="shrink-0">
+                <h1 className="text-5xl font-serif tracking-tight text-neutral-800 dark:text-neutral-100">
+                  KindleWood
+                </h1>
+                <p className="text-lg text-neutral-500 dark:text-neutral-400 mt-2">{greeting}</p>
+              </div>
+
+              {/* Right: search bar */}
+              <div className="flex items-center mt-3" style={{ position: 'relative', maxWidth: '320px', width: '100%' }}>
+                {/* Search icon */}
+                <svg
+                  width="16" height="16" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                  style={{
+                    position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)',
+                    color: searchQuery ? '#d97706' : '#9ca3af',
+                    pointerEvents: 'none', transition: 'color 0.2s',
+                  }}
+                >
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search your library…"
+                  className="w-full rounded-2xl text-sm outline-none"
+                  style={{
+                    padding: '10px 40px 10px 40px',
+                    background: 'rgba(255,255,255,0.08)',
+                    border: searchQuery
+                      ? '1.5px solid rgba(217,119,6,0.7)'
+                      : '1.5px solid rgba(255,255,255,0.15)',
+                    color: '#f5f0ea',
+                    caretColor: '#d97706',
+                    boxShadow: searchQuery ? '0 0 0 3px rgba(217,119,6,0.12)' : 'none',
+                    backdropFilter: 'blur(12px)',
+                    transition: 'all 0.2s ease',
+                  }}
+                  onFocus={(e) => {
+                    e.target.style.border = '1.5px solid rgba(217,119,6,0.7)';
+                    e.target.style.background = 'rgba(255,255,255,0.12)';
+                    e.target.style.boxShadow = '0 0 0 3px rgba(217,119,6,0.12)';
+                  }}
+                  onBlur={(e) => {
+                    if (!searchQuery) {
+                      e.target.style.border = '1.5px solid rgba(255,255,255,0.15)';
+                      e.target.style.background = 'rgba(255,255,255,0.08)';
+                      e.target.style.boxShadow = 'none';
+                    }
+                  }}
+                />
+
+                {/* Clear button */}
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    title="Clear search"
+                    style={{
+                      position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)',
+                      background: 'rgba(0,0,0,0.08)', border: 'none', borderRadius: '50%',
+                      width: '20px', height: '20px', cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      color: '#6b7280', transition: 'all 0.15s',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(217,119,6,0.15)'; e.currentTarget.style.color = '#d97706'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.08)'; e.currentTarget.style.color = '#6b7280'; }}
+                  >
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
 
             <div className="mt-8 flex space-x-2">
               {['all', 'favorites'].map((tab) => (
@@ -254,6 +335,24 @@ export default function KindleWoodLibrary() {
                 onDelete={handleDeleteRequest}
               />
             ))}
+            {/* Only show empty-search state when a query is active */}
+            {searchQuery.trim() && displayedBooks.length === 0 && (
+              <div className="col-span-full flex flex-col items-center justify-center py-24 text-center gap-4">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-600 dark:text-neutral-700">
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+                <p className="text-neutral-500 dark:text-neutral-600 text-sm font-medium">
+                  No books match &ldquo;{searchQuery}&rdquo;
+                </p>
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="text-xs text-amber-600 hover:text-amber-500 underline underline-offset-2 transition-colors"
+                >
+                  Clear search
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
