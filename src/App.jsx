@@ -611,6 +611,24 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
   const [loadError, setLoadError] = useState(false);
   const [pdfDark, setPdfDark] = useState(false);
   const [bookmarkPanelOpen, setBookmarkPanelOpen] = useState(false);
+  const [notes, setNotes] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(`kw_notes_${book.id}`) || '[]'); }
+    catch { return []; }
+  });
+
+  const saveNotes = (updated) => {
+    setNotes(updated);
+    localStorage.setItem(`kw_notes_${book.id}`, JSON.stringify(updated));
+  };
+  const addNote = () => saveNotes([...notes, {
+    id: Date.now(),
+    page: currentPage,
+    xPct: 5,
+    yPct: 5,
+    content: '',
+  }]);
+  const updateNote = (id, changes) => saveNotes(notes.map(n => n.id === id ? { ...n, ...changes } : n));
+  const deleteNote = (id) => saveNotes(notes.filter(n => n.id !== id));
   // Base page dimensions at scale:1. Fetched from PDF metadata — zero pixels rendered.
   // Used to give placeholder divs the correct height so the scrollbar stays accurate.
   const [baseDims, setBaseDims] = useState({ width: 612, height: 792 }); // A4 fallback
@@ -855,20 +873,14 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
                   className="my-4"
                   style={{
                     // ─ Windowing ────────────────────────────────────────────────
-                    // Placeholder keeps the exact footprint of a real rendered page
-                    // so the scrollbar length stays accurate for the full document.
+                    position: 'relative',           // so notes can be absolute-positioned inside
                     width: isRendered ? undefined : `${placeholderW}px`,
                     height: isRendered ? undefined : `${placeholderH}px`,
-                    // Subtle skeleton tint so the user can see blank "page" slots
                     background: isRendered ? undefined : 'rgba(255,255,255,0.025)',
                     borderRadius: '2px',
-                    overflow: 'hidden',
+                    overflow: 'visible',            // allow notes to peek outside page bounds
                     boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
-                    // ─ GPU compositing hint ─────────────────────────────────────
-                    // Promotes each page to its own GPU layer so the browser can
-                    // scroll using the compositor thread — no CPU paint on every frame.
                     willChange: 'transform',
-                    // ─ Dark mode ────────────────────────────────────────────────
                     filter: isRendered ? pageFilter : 'none',
                     transition: 'filter 0.35s ease',
                   }}
@@ -883,6 +895,15 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
                       className="block"
                     />
                   )}
+                  {/* ── Notes attached to this page ── */}
+                  {notes.filter(n => n.page === pageNum).map(note => (
+                    <StickyNote
+                      key={note.id}
+                      note={note}
+                      onUpdate={(changes) => updateNote(note.id, changes)}
+                      onDelete={() => deleteNote(note.id)}
+                    />
+                  ))}
                 </div>
               );
             })}
@@ -1048,6 +1069,7 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
         </div>
       )}
 
+
       {/* ── Floating Bookmark Button ── */}
       {numPages && (
         <div
@@ -1062,6 +1084,27 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
             gap: '10px',
           }}
         >
+          {/* Notes FAB — above bookmark */}
+          <button
+            onClick={addNote}
+            title="Add sticky note"
+            style={{
+              width: '42px', height: '42px', borderRadius: '10px',
+              border: '1px solid rgba(255,255,255,0.1)',
+              background: 'linear-gradient(160deg,#2a2520,#1a1612)',
+              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              boxShadow: '0 4px 16px rgba(0,0,0,0.45)',
+              transition: 'all 0.2s ease',
+              flexShrink: 0,
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(251,191,36,0.15)'; e.currentTarget.style.borderColor = 'rgba(251,191,36,0.35)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'linear-gradient(160deg,#2a2520,#1a1612)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; }}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+          </button>
           {/* Mini bookmark count pill — shown when there are bookmarks */}
           {bookmarks.length > 0 && !bookmarkPanelOpen && (
             <button
@@ -1158,6 +1201,179 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
           to   { transform: translateY(0);    opacity: 1; }
         }
       `}</style>
+    </div>
+  );
+}
+
+// ─── StickyNote ───────────────────────────────────────────────────────────────
+// Notes are rendered inside each page's wrapper div (position:relative).
+// xPct / yPct are percentages of the page width/height, so they survive zoom.
+function StickyNote({ note, onUpdate, onDelete }) {
+  const [hovered, setHovered] = useState(false);
+  const [editing, setEditing] = useState(!note.content);
+  const [draft, setDraft] = useState(note.content);
+  const textareaRef = useRef(null);
+  const didDrag = useRef(false);
+
+  // Auto-focus textarea when editor opens
+  useEffect(() => {
+    if (editing && textareaRef.current) textareaRef.current.focus();
+  }, [editing]);
+
+  // Drag: convert absolute mouse movement → percentage change within the page div
+  const handleMouseDown = (e) => {
+    if (editing || e.button !== 0) return;
+    e.preventDefault();
+    didDrag.current = false;
+
+    // Walk up to find the page wrapper (has data-page attribute)
+    const pageEl = e.currentTarget.closest('[data-page]');
+    if (!pageEl) return;
+
+    const startMouseX = e.clientX, startMouseY = e.clientY;
+    const startXPct = note.xPct, startYPct = note.yPct;
+
+    const onMouseMove = (ev) => {
+      didDrag.current = true;
+      const rect = pageEl.getBoundingClientRect();
+      const dxPct = ((ev.clientX - startMouseX) / rect.width) * 100;
+      const dyPct = ((ev.clientY - startMouseY) / rect.height) * 100;
+      onUpdate({
+        xPct: Math.max(0, Math.min(95, startXPct + dxPct)),
+        yPct: Math.max(0, Math.min(95, startYPct + dyPct)),
+      });
+    };
+    const onMouseUp = () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
+  const handleClick = () => {
+    if (didDrag.current) { didDrag.current = false; return; }
+    setEditing(true);
+  };
+
+  const handleSave = () => {
+    onUpdate({ content: draft });
+    setEditing(false);
+  };
+
+  const preview = note.content.trim();
+  const displayText = preview ? (preview.length > 130 ? preview.slice(0, 130) + '…' : preview) : null;
+
+  return (
+    <div style={{
+      position: 'absolute',
+      left: `${note.xPct}%`,
+      top: `${note.yPct}%`,
+      zIndex: 10,
+      userSelect: 'none',
+    }}>
+      {editing ? (
+        // ── Inline editor ──────────────────────────────────────────────────────
+        <div style={{
+          width: '240px',
+          background: 'linear-gradient(150deg, #fef9c3 0%, #fde68a 100%)',
+          borderRadius: '12px 12px 12px 2px',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.3)',
+          padding: '12px',
+          display: 'flex', flexDirection: 'column', gap: '10px',
+          border: '1px solid rgba(251,191,36,0.4)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '-2px' }}>
+            <span style={{ fontSize: '10px', fontWeight: 700, letterSpacing: '0.08em', color: '#92400e', textTransform: 'uppercase' }}>Note</span>
+            <button
+              onClick={onDelete}
+              title="Delete note"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px', color: '#b45309', lineHeight: 1 }}
+              onMouseEnter={(e) => e.currentTarget.style.color = '#dc2626'}
+              onMouseLeave={(e) => e.currentTarget.style.color = '#b45309'}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <path d="M18 6L6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleSave(); }}
+            placeholder="Write your note… (Ctrl+Enter to save)"
+            style={{
+              width: '100%', minHeight: '90px',
+              background: 'transparent', border: 'none', resize: 'vertical',
+              fontFamily: 'system-ui, sans-serif', fontSize: '13px',
+              lineHeight: 1.6, color: '#1c1200', outline: 'none',
+              boxSizing: 'border-box',
+            }}
+          />
+          <button
+            onClick={handleSave}
+            style={{
+              background: 'linear-gradient(135deg,#d97706,#b45309)', color: 'white',
+              border: 'none', borderRadius: '7px', padding: '5px 0',
+              fontSize: '12px', fontWeight: 700, cursor: 'pointer', width: '100%',
+              letterSpacing: '0.03em',
+            }}
+          >
+            Save
+          </button>
+        </div>
+      ) : (
+        // ── Collapsed / hover card ─────────────────────────────────────────────
+        <div
+          onMouseDown={handleMouseDown}
+          onClick={handleClick}
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
+          style={{
+            width: hovered ? '220px' : '46px',
+            minHeight: hovered ? '60px' : '54px',
+            background: hovered
+              ? 'linear-gradient(150deg, #fef9c3 0%, #fde68a 100%)'
+              : 'linear-gradient(150deg, #fbbf24 0%, #f59e0b 100%)',
+            borderRadius: hovered ? '10px 10px 10px 2px' : '8px 8px 8px 2px',
+            boxShadow: hovered
+              ? '0 10px 30px rgba(0,0,0,0.45)'
+              : '0 4px 14px rgba(0,0,0,0.35)',
+            cursor: hovered ? 'pointer' : 'grab',
+            transition: 'width 0.22s cubic-bezier(0.34,1.56,0.64,1), min-height 0.22s ease, border-radius 0.18s ease, background 0.18s ease, box-shadow 0.22s ease',
+            overflow: 'hidden',
+            display: 'flex',
+            alignItems: hovered ? 'flex-start' : 'center',
+            justifyContent: hovered ? 'flex-start' : 'center',
+            padding: hovered ? '10px 12px' : '0',
+            position: 'relative',
+          }}
+        >
+          {/* Bottom-left fold crease */}
+          <div style={{
+            position: 'absolute', bottom: 0, left: 0,
+            width: '10px', height: '10px',
+            background: 'rgba(0,0,0,0.1)',
+            clipPath: 'polygon(0 0, 100% 100%, 0 100%)',
+            pointerEvents: 'none',
+          }} />
+          {hovered ? (
+            displayText
+              ? <p style={{ fontSize: '12px', color: '#1c1200', lineHeight: 1.55, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {displayText}
+              </p>
+              : <p style={{ fontSize: '12px', color: '#92400e', fontStyle: 'italic', margin: 0 }}>
+                Empty — click to write
+              </p>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#92400e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+          )}
+        </div>
+      )}
     </div>
   );
 }
