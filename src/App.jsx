@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
+import { supabase } from './supabase.js';
 
 // Configure PDF.js worker using the bundled worker
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -79,22 +80,106 @@ export default function KindleWoodLibrary() {
   const [books, setBooks] = useState([]);
   const [openBook, setOpenBook] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [pendingBook, setPendingBook] = useState(null); // data waiting for user confirmation
+  const [pendingBook, setPendingBook] = useState(null);
   const fileInputRef = useRef(null);
 
-  // ── Bookmarks: { [bookId]: number[] } persisted in localStorage ──────────────
-  const [bookmarks, setBookmarks] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('kw_bookmarks') || '{}'); }
-    catch { return {}; }
-  });
+  // ── Auth session ──────────────────────────────────────────────────────
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Load books from Supabase when session is ready ───────────────────────
+  const [booksLoading, setBooksLoading] = useState(false);
+
+  useEffect(() => {
+    if (!session) return;
+    setBooksLoading(true);
+    supabase
+      .from('books')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .then(({ data, error }) => {
+        if (error) { console.error('Failed to load books:', error.message); }
+        else {
+          setBooks((data || []).map(row => ({
+            id: row.id,
+            title: row.title,
+            author: row.author,
+            cover: row.cover_url || null,
+            pdfUrl: row.pdf_path
+              ? supabase.storage.from('PDFs').getPublicUrl(row.pdf_path).data.publicUrl
+              : null,
+            favorite: row.favorite,
+          })));
+        }
+        setBooksLoading(false);
+      });
+  }, [session]);
+
+  // ── Intro splash ──────────────────────────────────────────────────────
+  const [introVisible, setIntroVisible] = useState(true);
+  const [introFading, setIntroFading] = useState(false);
+
+  useEffect(() => {
+    const fadeTimer = setTimeout(() => setIntroFading(true), 2400);  // start fade-out
+    const hideTimer = setTimeout(() => setIntroVisible(false), 3200); // remove from DOM
+    return () => { clearTimeout(fadeTimer); clearTimeout(hideTimer); };
+  }, []);
+
+  // ── Bookmarks: { [bookId]: number[] } ─ now backed by Supabase ───────────────
+  const [bookmarks, setBookmarks] = useState({});
+
+  // Fetch bookmarks for a book whenever it's opened
+  useEffect(() => {
+    if (!openBook || !session) return;
+    supabase
+      .from('bookmarks')
+      .select('page_number')
+      .eq('book_id', openBook.id)
+      .order('page_number')
+      .then(({ data, error }) => {
+        if (error) { console.error('Failed to load bookmarks:', error.message); return; }
+        setBookmarks(prev => ({
+          ...prev,
+          [openBook.id]: (data || []).map(r => r.page_number),
+        }));
+      });
+  }, [openBook, session]);
+
+  // Compare old vs new array → INSERT added pages, DELETE removed pages
   const updateBookmarks = useCallback((bookId, updater) => {
     setBookmarks((prev) => {
-      const next = { ...prev, [bookId]: updater(prev[bookId] || []) };
-      localStorage.setItem('kw_bookmarks', JSON.stringify(next));
-      return next;
+      const oldPages = prev[bookId] || [];
+      const newPages = updater(oldPages);
+
+      const added = newPages.filter(p => !oldPages.includes(p));
+      const removed = oldPages.filter(p => !newPages.includes(p));
+
+      added.forEach(page => {
+        supabase.from('bookmarks')
+          .insert({ user_id: session.user.id, book_id: bookId, page_number: page })
+          .then(({ error }) => { if (error) console.error('Bookmark insert failed:', error.message); });
+      });
+      removed.forEach(page => {
+        supabase.from('bookmarks')
+          .delete().eq('book_id', bookId).eq('page_number', page)
+          .then(({ error }) => { if (error) console.error('Bookmark delete failed:', error.message); });
+      });
+
+      return { ...prev, [bookId]: newPages };
     });
-  }, []);
+  }, [session]);
 
   useEffect(() => {
     const hour = new Date().getHours();
@@ -109,22 +194,19 @@ export default function KindleWoodLibrary() {
     if (!file || file.type !== 'application/pdf') return;
     setIsUploading(true);
 
-    // Kick off both in parallel: PDF processing and Google Books lookup start at the same time.
-    // The filename-based title is available immediately, so no need to wait for PDF metadata.
     const fileTitle = titleFromFilename(file.name);
     const [
       { metaTitle, metaAuthor, cover: pdfCover },
       bookInfo,
     ] = await Promise.all([
       extractPdfMeta(file),
-      fetchBookInfo(fileTitle),   // start network call right away using filename
+      fetchBookInfo(fileTitle),
     ]);
 
-    // Compose best-guess data — prefer Google Books, fall back to PDF metadata, then filename
-    const pdfUrl = URL.createObjectURL(file);
+    // Store the raw File — we upload only after the user confirms
     setPendingBook({
-      pdfUrl,
-      cover: bookInfo?.cover || pdfCover,
+      file,                                        // ← raw File object
+      cover: bookInfo?.cover || pdfCover || null,
       title: bookInfo?.title || metaTitle || fileTitle,
       author: bookInfo?.author || metaAuthor || '',
     });
@@ -133,32 +215,73 @@ export default function KindleWoodLibrary() {
     e.target.value = '';
   }, []);
 
-  const handleBookConfirm = useCallback(({ title, author }) => {
+  const handleBookConfirm = useCallback(async ({ title, author }) => {
     if (!pendingBook) return;
-    setBooks((prev) => [
-      ...prev,
-      {
-        id: Date.now(),
-        title: title.trim() || 'Untitled Book',
-        author: author.trim() || 'Unknown Author',
-        favorite: false,
-        cover: pendingBook.cover,
-        pdfUrl: pendingBook.pdfUrl,
-      },
-    ]);
-    setPendingBook(null);
-  }, [pendingBook]);
+    setIsUploading(true);
+    try {
+      // 1. Upload PDF to Supabase Storage
+      const filePath = `${session.user.id}/${Date.now()}_${pendingBook.file.name}`;
+      const { error: uploadError } = await supabase.storage
+        .from('PDFs')
+        .upload(filePath, pendingBook.file);
+      if (uploadError) throw uploadError;
+
+      // 2. Get public URL for the reader
+      const { data: { publicUrl } } = supabase.storage
+        .from('PDFs')
+        .getPublicUrl(filePath);
+
+      // 3. Insert book row
+      const { data: row, error: insertError } = await supabase
+        .from('books')
+        .insert({
+          user_id: session.user.id,
+          title: title.trim() || 'Untitled Book',
+          author: author.trim() || 'Unknown Author',
+          cover_url: pendingBook.cover || null,
+          pdf_path: filePath,
+          favorite: false,
+        })
+        .select()
+        .single();
+      if (insertError) throw insertError;
+
+      // 4. Prepend to local state (no need to refetch)
+      setBooks((prev) => [{
+        id: row.id,
+        title: row.title,
+        author: row.author,
+        cover: row.cover_url,
+        pdfUrl: publicUrl,
+        favorite: row.favorite,
+      }, ...prev]);
+    } catch (err) {
+      console.error('Failed to add book:', err.message);
+      alert(`Upload failed: ${err.message}`);
+    } finally {
+      setIsUploading(false);
+      setPendingBook(null);
+    }
+  }, [pendingBook, session]);
 
   const handleBookCancel = useCallback(() => {
-    if (pendingBook?.pdfUrl) URL.revokeObjectURL(pendingBook.pdfUrl);
-    setPendingBook(null);
-  }, [pendingBook]);
-
-  const toggleFavorite = useCallback((id) => {
-    setBooks((prev) =>
-      prev.map((b) => (b.id === id ? { ...b, favorite: !b.favorite } : b))
-    );
+    setPendingBook(null); // no blob URL to revoke — file stays in memory briefly then GC'd
   }, []);
+
+  const toggleFavorite = useCallback(async (id) => {
+    const book = books.find(b => b.id === id);
+    if (!book) return;
+    const newFav = !book.favorite;
+    // Optimistic update
+    setBooks(prev => prev.map(b => b.id === id ? { ...b, favorite: newFav } : b));
+    const { error } = await supabase.from('books').update({ favorite: newFav }).eq('id', id);
+    if (error) {
+      console.error('Failed to update favorite:', error.message);
+      // Revert on failure
+      setBooks(prev => prev.map(b => b.id === id ? { ...b, favorite: !newFav } : b));
+    }
+  }, [books]);
+
 
   const [bookToDelete, setBookToDelete] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -169,10 +292,22 @@ export default function KindleWoodLibrary() {
 
   const handleDeleteConfirm = useCallback(() => {
     if (!bookToDelete) return;
-    // Free the blob URL so memory isn't leaked
-    if (bookToDelete.pdfUrl) URL.revokeObjectURL(bookToDelete.pdfUrl);
+    // 1. Remove PDF from Storage (best-effort — don't block on failure)
+    if (bookToDelete.pdfUrl) {
+      // Derive the storage path from the public URL
+      const url = new URL(bookToDelete.pdfUrl);
+      // Public URLs look like: /storage/v1/object/public/PDFs/<path>
+      const pathMatch = url.pathname.match(/\/PDFs\/(.+)$/);
+      if (pathMatch) {
+        supabase.storage.from('PDFs').remove([pathMatch[1]]).catch(console.error);
+      }
+    }
+    // 2. Delete DB row (bookmarks + notes cascade automatically)
+    supabase.from('books').delete().eq('id', bookToDelete.id).then(({ error }) => {
+      if (error) console.error('Failed to delete book:', error.message);
+    });
+    // 3. Remove from local state immediately
     setBooks((prev) => prev.filter((b) => b.id !== bookToDelete.id));
-    // Close reader if this book was open
     setOpenBook((cur) => (cur?.id === bookToDelete.id ? null : cur));
     setBookToDelete(null);
   }, [bookToDelete]);
@@ -189,8 +324,90 @@ export default function KindleWoodLibrary() {
     )
     : tabFiltered;
 
+  // ── Auth gate ────────────────────────────────────────────────────────────────
+  if (authLoading) return (
+    <div style={{
+      position: 'fixed', inset: 0, background: '#0a0806',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      <div style={{
+        width: '36px', height: '36px', borderRadius: '50%',
+        border: '3px solid rgba(217,119,6,0.2)',
+        borderTopColor: '#d97706',
+        animation: 'spin 0.8s linear infinite',
+      }} />
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+  if (!session) return <AuthPage />;
+
   return (
     <>
+      {/* ── Intro Splash ─────────────────────────────────────────── */}
+      {introVisible && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'radial-gradient(ellipse at 30% 40%, #1a1008 0%, #0a0806 60%, #060402 100%)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: '14px',
+          opacity: introFading ? 0 : 1,
+          transition: 'opacity 0.8s cubic-bezier(0.4,0,0.2,1)',
+          pointerEvents: introFading ? 'none' : 'all',
+        }}>
+          <style>{`
+            @keyframes kwFadeUp {
+              from { opacity: 0; transform: translateY(22px); }
+              to   { opacity: 1; transform: translateY(0); }
+            }
+            @keyframes kwLineGrow {
+              from { width: 0; opacity: 0; }
+              to   { width: 48px; opacity: 1; }
+            }
+          `}</style>
+
+          {/* Ambient glow behind text */}
+          <div style={{
+            position: 'absolute',
+            width: '500px', height: '300px',
+            background: 'radial-gradient(ellipse, rgba(217,119,6,0.12) 0%, transparent 70%)',
+            pointerEvents: 'none',
+          }} />
+
+          {/* KindleWood wordmark */}
+          <h1 style={{
+            fontFamily: 'Georgia, "Times New Roman", serif',
+            fontSize: 'clamp(2.8rem, 6vw, 5rem)',
+            fontWeight: 400,
+            color: '#f5ede0',
+            letterSpacing: '-0.02em',
+            margin: 0,
+            animation: 'kwFadeUp 1s cubic-bezier(0.22,1,0.36,1) 0.25s both',
+          }}>
+            KindleWood
+          </h1>
+
+          {/* Amber divider line */}
+          <div style={{
+            height: '1.5px',
+            background: 'linear-gradient(90deg, transparent, #d97706, transparent)',
+            animation: 'kwLineGrow 0.8s cubic-bezier(0.22,1,0.36,1) 1s both',
+          }} />
+
+          {/* Tagline */}
+          <p style={{
+            fontFamily: 'system-ui, sans-serif',
+            fontSize: 'clamp(0.8rem, 1.5vw, 1rem)',
+            color: '#7a6a58',
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            margin: 0,
+            animation: 'kwFadeUp 1s cubic-bezier(0.22,1,0.36,1) 1.1s both',
+          }}>
+            We care about your Reading Experience
+          </p>
+        </div>
+      )}
+
       {/* ── Book Info Confirmation Modal ───────────────────────────── */}
       {pendingBook && (
         <BookInfoModal
@@ -216,6 +433,7 @@ export default function KindleWoodLibrary() {
           onClose={() => setOpenBook(null)}
           bookmarks={bookmarks[openBook.id] || []}
           onUpdateBookmarks={(updater) => updateBookmarks(openBook.id, updater)}
+          session={session}
         />
       )}
 
@@ -308,6 +526,44 @@ export default function KindleWoodLibrary() {
               </div>
             </div>
 
+            {/* User avatar + sign out */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px' }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '8px',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.1)',
+                borderRadius: '999px', padding: '5px 12px 5px 5px',
+              }}>
+                {/* Avatar circle */}
+                <div style={{
+                  width: '28px', height: '28px', borderRadius: '50%',
+                  background: 'linear-gradient(135deg, #d97706, #92400e)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: '12px', fontWeight: 700, color: 'white', flexShrink: 0,
+                }}>
+                  {(session.user.email?.[0] || session.user.user_metadata?.name?.[0] || '?').toUpperCase()}
+                </div>
+                <span style={{ fontSize: '12px', color: '#9ca3af', maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {session.user.user_metadata?.full_name || session.user.email}
+                </span>
+              </div>
+              <button
+                onClick={() => supabase.auth.signOut()}
+                title="Sign out"
+                style={{
+                  background: 'rgba(255,255,255,0.05)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  borderRadius: '8px', padding: '7px 12px',
+                  fontSize: '12px', color: '#6b7280', cursor: 'pointer',
+                  transition: 'all 0.15s',
+                }}
+                onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'rgba(239,68,68,0.4)'; e.currentTarget.style.color = '#ef4444'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.color = '#6b7280'; }}
+              >
+                Sign out
+              </button>
+            </div>
+
             <div className="mt-8 flex space-x-2">
               {['all', 'favorites'].map((tab) => (
                 <button
@@ -326,34 +582,55 @@ export default function KindleWoodLibrary() {
 
           {/* Book Grid */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-8 max-w-7xl mx-auto">
-            {displayedBooks.map((book) => (
-              <BookCard
-                key={book.id}
-                book={book}
-                onClick={() => book.pdfUrl && setOpenBook(book)}
-                onToggleFavorite={toggleFavorite}
-                onDelete={handleDeleteRequest}
-              />
-            ))}
-            {/* Only show empty-search state when a query is active */}
-            {searchQuery.trim() && displayedBooks.length === 0 && (
-              <div className="col-span-full flex flex-col items-center justify-center py-24 text-center gap-4">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-600 dark:text-neutral-700">
-                  <circle cx="11" cy="11" r="8" />
-                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                </svg>
-                <p className="text-neutral-500 dark:text-neutral-600 text-sm font-medium">
-                  No books match &ldquo;{searchQuery}&rdquo;
-                </p>
-                <button
-                  onClick={() => setSearchQuery('')}
-                  className="text-xs text-amber-600 hover:text-amber-500 underline underline-offset-2 transition-colors"
-                >
-                  Clear search
-                </button>
-              </div>
+            {booksLoading ? (
+              // Skeleton cards while loading
+              Array.from({ length: 5 }).map((_, i) => (
+                <div key={i} style={{
+                  borderRadius: '16px', overflow: 'hidden',
+                  background: 'rgba(255,255,255,0.04)',
+                  border: '1px solid rgba(255,255,255,0.06)',
+                  animation: `pulse 1.6s ease-in-out ${i * 0.1}s infinite`,
+                }}>
+                  <div style={{ aspectRatio: '2/3', background: 'rgba(255,255,255,0.05)' }} />
+                  <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ height: '12px', borderRadius: '6px', background: 'rgba(255,255,255,0.07)', width: '80%' }} />
+                    <div style={{ height: '10px', borderRadius: '6px', background: 'rgba(255,255,255,0.04)', width: '55%' }} />
+                  </div>
+                </div>
+              ))
+            ) : (
+              <>
+                {displayedBooks.map((book) => (
+                  <BookCard
+                    key={book.id}
+                    book={book}
+                    onClick={() => book.pdfUrl && setOpenBook(book)}
+                    onToggleFavorite={toggleFavorite}
+                    onDelete={handleDeleteRequest}
+                  />
+                ))}
+                {/* Only show empty-search state when a query is active */}
+                {searchQuery.trim() && displayedBooks.length === 0 && (
+                  <div className="col-span-full flex flex-col items-center justify-center py-24 text-center gap-4">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-neutral-600 dark:text-neutral-700">
+                      <circle cx="11" cy="11" r="8" />
+                      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg>
+                    <p className="text-neutral-500 dark:text-neutral-600 text-sm font-medium">
+                      No books match &ldquo;{searchQuery}&rdquo;
+                    </p>
+                    <button
+                      onClick={() => setSearchQuery('')}
+                      className="text-xs text-amber-600 hover:text-amber-500 underline underline-offset-2 transition-colors"
+                    >
+                      Clear search
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
+          <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }`}</style>
         </div>
 
         {/* Hidden PDF input */}
@@ -703,31 +980,70 @@ function DeleteConfirmModal({ book, onConfirm, onCancel }) {
 // Everything outside this window is replaced by a lightweight placeholder div.
 const PDF_RENDER_BUFFER = 2;
 
-function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks }) {
+function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [scale, setScale] = useState(1.2);
   const [loadError, setLoadError] = useState(false);
   const [pdfDark, setPdfDark] = useState(false);
   const [bookmarkPanelOpen, setBookmarkPanelOpen] = useState(false);
-  const [notes, setNotes] = useState(() => {
-    try { return JSON.parse(localStorage.getItem(`kw_notes_${book.id}`) || '[]'); }
-    catch { return []; }
-  });
+  const [notes, setNotes] = useState([]);
 
-  const saveNotes = (updated) => {
-    setNotes(updated);
-    localStorage.setItem(`kw_notes_${book.id}`, JSON.stringify(updated));
+  // ── Load notes from Supabase when the reader opens ─────────────────────────
+  useEffect(() => {
+    if (!session) return;
+    supabase
+      .from('notes')
+      .select('*')
+      .eq('book_id', book.id)
+      .then(({ data, error }) => {
+        if (error) { console.error('Failed to load notes:', error.message); return; }
+        setNotes((data || []).map(r => ({
+          id: r.id,
+          page: r.page,
+          xPct: r.x_pct,
+          yPct: r.y_pct,
+          content: r.content,
+        })));
+      });
+  }, [book.id, session]);
+
+  const addNote = async () => {
+    const { data: row, error } = await supabase
+      .from('notes')
+      .insert({
+        user_id: session.user.id,
+        book_id: book.id,
+        page: currentPage,
+        x_pct: 5,
+        y_pct: 5,
+        content: '',
+      })
+      .select()
+      .single();
+    if (error) { console.error('Failed to add note:', error.message); return; }
+    setNotes(prev => [...prev, { id: row.id, page: row.page, xPct: row.x_pct, yPct: row.y_pct, content: row.content }]);
   };
-  const addNote = () => saveNotes([...notes, {
-    id: Date.now(),
-    page: currentPage,
-    xPct: 5,
-    yPct: 5,
-    content: '',
-  }]);
-  const updateNote = (id, changes) => saveNotes(notes.map(n => n.id === id ? { ...n, ...changes } : n));
-  const deleteNote = (id) => saveNotes(notes.filter(n => n.id !== id));
+
+  const updateNote = (id, changes) => {
+    // Optimistic local update
+    setNotes(prev => prev.map(n => n.id === id ? { ...n, ...changes } : n));
+    // Build DB payload — map camelCase back to snake_case
+    const dbPayload = {};
+    if (changes.xPct !== undefined) dbPayload.x_pct = changes.xPct;
+    if (changes.yPct !== undefined) dbPayload.y_pct = changes.yPct;
+    if (changes.content !== undefined) dbPayload.content = changes.content;
+    if (Object.keys(dbPayload).length) {
+      supabase.from('notes').update(dbPayload).eq('id', id)
+        .then(({ error }) => { if (error) console.error('Note update failed:', error.message); });
+    }
+  };
+
+  const deleteNote = (id) => {
+    setNotes(prev => prev.filter(n => n.id !== id));
+    supabase.from('notes').delete().eq('id', id)
+      .then(({ error }) => { if (error) console.error('Note delete failed:', error.message); });
+  };
   // Base page dimensions at scale:1. Fetched from PDF metadata — zero pixels rendered.
   // Used to give placeholder divs the correct height so the scrollbar stays accurate.
   const [baseDims, setBaseDims] = useState({ width: 612, height: 792 }); // A4 fallback
@@ -1473,6 +1789,201 @@ function StickyNote({ note, onUpdate, onDelete }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── AuthPage ─────────────────────────────────────────────────────────────────
+function AuthPage() {
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [successMsg, setSuccessMsg] = useState('');
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setSuccessMsg('');
+    setLoading(true);
+    try {
+      if (mode === 'signin') {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        setSuccessMsg('Check your email for a confirmation link!');
+      }
+    } catch (err) {
+      setError(err.message || 'Something went wrong.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogle = async () => {
+    setGoogleLoading(true);
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) { setError(error.message); setGoogleLoading(false); }
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0,
+      background: 'radial-gradient(ellipse at 30% 40%, #1a1008 0%, #0a0806 60%, #060402 100%)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: 'system-ui, sans-serif',
+    }}>
+      <style>{`
+        @keyframes authFadeUp {
+          from { opacity: 0; transform: translateY(24px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+        .auth-input {
+          width: 100%; padding: 11px 14px; border-radius: 10px; font-size: 14px;
+          background: rgba(255,255,255,0.06); color: #f5ede0;
+          border: 1.5px solid rgba(255,255,255,0.1); outline: none;
+          transition: border-color 0.2s, box-shadow 0.2s; box-sizing: border-box;
+          caret-color: #d97706;
+        }
+        .auth-input::placeholder { color: #6b5c48; }
+        .auth-input:focus {
+          border-color: rgba(217,119,6,0.6);
+          box-shadow: 0 0 0 3px rgba(217,119,6,0.1);
+          background: rgba(255,255,255,0.09);
+        }
+      `}</style>
+
+      {/* Ambient glow */}
+      <div style={{
+        position: 'absolute', width: '600px', height: '400px',
+        background: 'radial-gradient(ellipse, rgba(217,119,6,0.1) 0%, transparent 65%)',
+        pointerEvents: 'none',
+      }} />
+
+      {/* Card */}
+      <div style={{
+        position: 'relative', width: '100%', maxWidth: '400px', margin: '0 16px',
+        background: 'rgba(255,255,255,0.04)',
+        border: '1px solid rgba(255,255,255,0.09)',
+        borderRadius: '20px',
+        padding: '40px 36px 36px',
+        boxShadow: '0 24px 80px rgba(0,0,0,0.6)',
+        backdropFilter: 'blur(20px)',
+        animation: 'authFadeUp 0.7s cubic-bezier(0.22,1,0.36,1) both',
+      }}>
+        {/* Logo */}
+        <div style={{ textAlign: 'center', marginBottom: '28px' }}>
+          <h1 style={{
+            fontFamily: 'Georgia, serif', fontSize: '2rem', fontWeight: 400,
+            color: '#f5ede0', letterSpacing: '-0.02em', margin: '0 0 4px',
+          }}>KindleWood</h1>
+          <p style={{ fontSize: '12px', color: '#7a6a58', letterSpacing: '0.08em', margin: 0 }}>
+            YOUR READING COMPANION
+          </p>
+        </div>
+
+        {/* Mode tabs */}
+        <div style={{
+          display: 'flex', background: 'rgba(0,0,0,0.3)', borderRadius: '10px',
+          padding: '4px', marginBottom: '24px',
+        }}>
+          {['signin', 'signup'].map((m) => (
+            <button key={m} onClick={() => { setMode(m); setError(''); setSuccessMsg(''); }}
+              style={{
+                flex: 1, padding: '8px', border: 'none', borderRadius: '8px',
+                fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                transition: 'all 0.2s',
+                background: mode === m ? 'rgba(217,119,6,0.25)' : 'transparent',
+                color: mode === m ? '#f5c842' : '#6b7280',
+                boxShadow: mode === m ? '0 1px 4px rgba(0,0,0,0.3)' : 'none',
+              }}>
+              {m === 'signin' ? 'Sign in' : 'Sign up'}
+            </button>
+          ))}
+        </div>
+
+        {/* Form */}
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <input
+            className="auth-input"
+            type="email" placeholder="Email address"
+            value={email} onChange={(e) => setEmail(e.target.value)}
+            required autoFocus
+          />
+          <input
+            className="auth-input"
+            type="password" placeholder="Password"
+            value={password} onChange={(e) => setPassword(e.target.value)}
+            required minLength={6}
+          />
+
+          {/* Error / success */}
+          {error && (
+            <p style={{ fontSize: '12px', color: '#f87171', margin: '2px 0 0', padding: '8px 12px', background: 'rgba(239,68,68,0.08)', borderRadius: '8px', border: '1px solid rgba(239,68,68,0.2)' }}>
+              {error}
+            </p>
+          )}
+          {successMsg && (
+            <p style={{ fontSize: '12px', color: '#6ee7b7', margin: '2px 0 0', padding: '8px 12px', background: 'rgba(16,185,129,0.08)', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.2)' }}>
+              {successMsg}
+            </p>
+          )}
+
+          <button
+            type="submit" disabled={loading}
+            style={{
+              marginTop: '4px', padding: '12px', border: 'none', borderRadius: '10px',
+              background: loading ? 'rgba(217,119,6,0.4)' : 'linear-gradient(135deg, #d97706, #b45309)',
+              color: 'white', fontSize: '14px', fontWeight: 700,
+              cursor: loading ? 'not-allowed' : 'pointer',
+              transition: 'all 0.2s', letterSpacing: '0.02em',
+              boxShadow: '0 4px 16px rgba(217,119,6,0.3)',
+            }}
+            onMouseEnter={(e) => { if (!loading) e.currentTarget.style.transform = 'translateY(-1px)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = 'none'; }}
+          >
+            {loading ? '…' : mode === 'signin' ? 'Sign in' : 'Create account'}
+          </button>
+        </form>
+
+        {/* Divider */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: '20px 0' }}>
+          <div style={{ flex: 1, height: '1px', background: 'rgba(255,255,255,0.08)' }} />
+          <span style={{ fontSize: '11px', color: '#4b5563', userSelect: 'none' }}>or</span>
+          <div style={{ flex: 1, height: '1px', background: 'rgba(255,255,255,0.08)' }} />
+        </div>
+
+        {/* Google button */}
+        <button
+          onClick={handleGoogle} disabled={googleLoading}
+          style={{
+            width: '100%', padding: '11px', border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: '10px', background: 'rgba(255,255,255,0.05)',
+            color: '#e5e7eb', fontSize: '13px', fontWeight: 600,
+            cursor: googleLoading ? 'not-allowed' : 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
+            transition: 'all 0.2s',
+          }}
+          onMouseEnter={(e) => { if (!googleLoading) { e.currentTarget.style.background = 'rgba(255,255,255,0.1)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.2)'; } }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.12)'; }}
+        >
+          {/* Google "G" logo */}
+          <svg width="16" height="16" viewBox="0 0 24 24">
+            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+          </svg>
+          {googleLoading ? 'Redirecting…' : 'Continue with Google'}
+        </button>
+      </div>
     </div>
   );
 }
