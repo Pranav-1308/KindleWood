@@ -438,25 +438,25 @@ export default function KindleWoodLibrary() {
       )}
 
       {/* ── Main Library Page ──────────────────────────────────────── */}
-      <div className="min-h-screen bg-[#f7f5f2] dark:bg-[#0a0806] p-12 pb-28 transition-colors duration-300 font-sans relative overflow-hidden">
+      <div className="min-h-screen bg-[#f7f5f2] dark:bg-[#0a0806] p-4 sm:p-8 md:p-12 pb-28 transition-colors duration-300 font-sans relative overflow-hidden">
         {/* Ambient light blobs */}
         <div className="absolute top-[-10%] left-[-10%] w-[500px] h-[500px] bg-amber-600/30 dark:bg-amber-700/20 rounded-full blur-[120px] pointer-events-none z-0" />
         <div className="absolute bottom-[-10%] right-[-10%] w-[600px] h-[600px] bg-orange-400/20 dark:bg-orange-900/20 rounded-full blur-[150px] pointer-events-none z-0" />
 
         <div className="relative z-10">
           {/* Header row: title left, search right */}
-          <header className="mb-12 max-w-7xl mx-auto">
-            <div className="flex items-start justify-between gap-8">
+          <header className="mb-8 sm:mb-12 max-w-7xl mx-auto">
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 sm:gap-8">
               {/* Left: title + greeting */}
               <div className="shrink-0">
-                <h1 className="text-5xl font-serif tracking-tight text-neutral-800 dark:text-neutral-100">
+                <h1 className="text-3xl sm:text-5xl font-serif tracking-tight text-neutral-800 dark:text-neutral-100">
                   KindleWood
                 </h1>
-                <p className="text-lg text-neutral-500 dark:text-neutral-400 mt-2">{greeting}</p>
+                <p className="text-base sm:text-lg text-neutral-500 dark:text-neutral-400 mt-1 sm:mt-2">{greeting}</p>
               </div>
 
               {/* Right: search bar */}
-              <div className="flex items-center mt-3" style={{ position: 'relative', maxWidth: '320px', width: '100%' }}>
+              <div className="flex items-center sm:mt-3" style={{ position: 'relative', width: '100%', maxWidth: '320px' }}>
                 {/* Search icon */}
                 <svg
                   width="16" height="16" viewBox="0 0 24 24" fill="none"
@@ -527,7 +527,7 @@ export default function KindleWoodLibrary() {
             </div>
 
             {/* User avatar + sign out */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px', flexWrap: 'wrap' }}>
               <div style={{
                 display: 'flex', alignItems: 'center', gap: '8px',
                 background: 'rgba(255,255,255,0.06)',
@@ -564,7 +564,7 @@ export default function KindleWoodLibrary() {
               </button>
             </div>
 
-            <div className="mt-8 flex space-x-2">
+            <div className="mt-5 sm:mt-8 flex space-x-2">
               {['all', 'favorites'].map((tab) => (
                 <button
                   key={tab}
@@ -581,7 +581,7 @@ export default function KindleWoodLibrary() {
           </header>
 
           {/* Book Grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-8 max-w-7xl mx-auto">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4 sm:gap-6 lg:gap-8 max-w-7xl mx-auto">
             {booksLoading ? (
               // Skeleton cards while loading
               Array.from({ length: 5 }).map((_, i) => (
@@ -646,7 +646,7 @@ export default function KindleWoodLibrary() {
         <button
           onClick={() => fileInputRef.current?.click()}
           disabled={isUploading || !!pendingBook}
-          className="fixed bottom-10 right-10 z-50 group flex items-center justify-center w-16 h-16 bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 rounded-full shadow-2xl hover:w-44 transition-all duration-300 overflow-hidden active:scale-90 cursor-pointer border border-neutral-800 dark:border-neutral-200 disabled:opacity-60"
+          className="fixed bottom-6 right-5 sm:bottom-10 sm:right-10 z-50 group flex items-center justify-center w-14 h-14 sm:w-16 sm:h-16 bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 rounded-full shadow-2xl hover:w-44 transition-all duration-300 overflow-hidden active:scale-90 cursor-pointer border border-neutral-800 dark:border-neutral-200 disabled:opacity-60"
           title="Upload a PDF"
         >
           {isUploading ? (
@@ -816,9 +816,9 @@ function BookInfoModal({ initialData, onConfirm, onCancel }) {
             </button>
           </div>
 
-          <div className="flex gap-6">
+          <div className="flex flex-col sm:flex-row gap-5 sm:gap-6">
             {/* Cover preview */}
-            <div className="shrink-0 w-28 aspect-[2/3] rounded-xl overflow-hidden shadow-lg border border-white/10">
+            <div className="shrink-0 w-20 sm:w-28 aspect-[2/3] rounded-xl overflow-hidden shadow-lg border border-white/10 mx-auto sm:mx-0">
               {initialData.cover ? (
                 <img
                   src={initialData.cover}
@@ -983,7 +983,8 @@ const PDF_RENDER_BUFFER = 2;
 function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
-  const [scale, setScale] = useState(1.2);
+  // Start at a smaller scale on narrow screens so the page fits without horizontal scroll
+  const [scale, setScale] = useState(() => window.innerWidth < 640 ? 0.6 : 1.2);
   const [loadError, setLoadError] = useState(false);
   const [pdfDark, setPdfDark] = useState(false);
   const [bookmarkPanelOpen, setBookmarkPanelOpen] = useState(false);
@@ -1156,53 +1157,53 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
   return (
     <div className="fixed inset-0 z-[100] flex flex-col bg-[#1a1814]" style={{ fontFamily: 'system-ui, sans-serif' }}>
       {/* ── Top Bar ── */}
-      <div className="flex items-center justify-between px-6 py-3 bg-[#111]/80 backdrop-blur border-b border-white/10 z-10 shrink-0">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-y-2 px-3 sm:px-6 py-2 sm:py-3 bg-[#111]/80 backdrop-blur border-b border-white/10 z-10 shrink-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
           <button
             onClick={onClose}
-            className="text-neutral-400 hover:text-white transition-colors p-2 rounded-full hover:bg-white/10"
+            className="text-neutral-400 hover:text-white transition-colors p-2 rounded-full hover:bg-white/10 shrink-0"
             title="Close (Esc)"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
               <path d="M19 12H5M12 5l-7 7 7 7" />
             </svg>
           </button>
-          <div>
-            <h2 className="text-white font-semibold text-sm leading-tight">{book.title}</h2>
-            <p className="text-neutral-500 text-xs">{book.author}</p>
+          <div className="min-w-0">
+            <h2 className="text-white font-semibold text-sm leading-tight truncate">{book.title}</h2>
+            <p className="text-neutral-500 text-xs truncate">{book.author}</p>
           </div>
         </div>
 
-        {/* Page controls */}
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => scrollToPage(Math.max(1, currentPage - 1))}
-            disabled={currentPage <= 1}
-            className="text-neutral-400 hover:text-white disabled:opacity-30 p-1.5 rounded hover:bg-white/10 transition-all"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M15 18l-6-6 6-6" /></svg>
-          </button>
-          <span className="text-neutral-300 text-sm tabular-nums min-w-[80px] text-center">
-            {numPages ? `${currentPage} / ${numPages}` : '…'}
-          </span>
-          <button
-            onClick={() => scrollToPage(Math.min(numPages || 1, currentPage + 1))}
-            disabled={!numPages || currentPage >= numPages}
-            className="text-neutral-400 hover:text-white disabled:opacity-30 p-1.5 rounded hover:bg-white/10 transition-all"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M9 18l6-6-6-6" /></svg>
-          </button>
-        </div>
+        {/* Page controls + zoom + dark — grouped right, wrap onto 2nd row on mobile */}
+        <div className="flex items-center gap-2 sm:gap-3 shrink-0 flex-wrap justify-end">
+          <div className="flex items-center gap-1 sm:gap-3">
+            <button
+              onClick={() => scrollToPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+              className="text-neutral-400 hover:text-white disabled:opacity-30 p-1.5 rounded hover:bg-white/10 transition-all"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M15 18l-6-6 6-6" /></svg>
+            </button>
+            <span className="text-neutral-300 text-xs tabular-nums min-w-[56px] text-center">
+              {numPages ? `${currentPage} / ${numPages}` : '…'}
+            </span>
+            <button
+              onClick={() => scrollToPage(Math.min(numPages || 1, currentPage + 1))}
+              disabled={!numPages || currentPage >= numPages}
+              className="text-neutral-400 hover:text-white disabled:opacity-30 p-1.5 rounded hover:bg-white/10 transition-all"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M9 18l6-6-6-6" /></svg>
+            </button>
+          </div>
 
-        {/* Zoom + dark-mode toggle */}
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
+          {/* Zoom controls */}
+          <div className="flex items-center gap-1">
             <button
               onClick={() => setScale((s) => Math.max(0.5, +(s - 0.2).toFixed(1)))}
               className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
               title="Zoom out"
             >−</button>
-            <span className="text-neutral-300 text-xs w-10 text-center">{Math.round(scale * 100)}%</span>
+            <span className="text-neutral-300 text-xs w-9 text-center">{Math.round(scale * 100)}%</span>
             <button
               onClick={() => setScale((s) => Math.min(3, +(s + 0.2).toFixed(1)))}
               className="text-neutral-400 hover:text-white p-1.5 rounded hover:bg-white/10 transition-all text-lg leading-none"
@@ -1215,27 +1216,27 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
             onClick={() => setPdfDark((d) => !d)}
             title={pdfDark ? 'Switch to light mode' : 'Switch to dark mode'}
             style={{
-              display: 'flex', alignItems: 'center', gap: '6px',
-              padding: '5px 12px 5px 8px', borderRadius: '999px',
+              display: 'flex', alignItems: 'center', gap: '4px',
+              padding: '5px 8px 5px 6px', borderRadius: '999px',
               border: pdfDark ? '1px solid rgba(245,200,66,0.4)' : '1px solid rgba(255,255,255,0.12)',
               background: pdfDark ? 'rgba(245,200,66,0.12)' : 'rgba(255,255,255,0.07)',
               color: pdfDark ? '#f5c842' : '#a3a3a3',
-              fontSize: '12px', fontWeight: 600, cursor: 'pointer',
-              transition: 'all 0.25s ease', letterSpacing: '0.02em',
+              fontSize: '11px', fontWeight: 600, cursor: 'pointer',
+              transition: 'all 0.25s ease', letterSpacing: '0.02em', whiteSpace: 'nowrap',
             }}
           >
             <span style={{
               display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              width: '20px', height: '20px', borderRadius: '50%',
+              width: '18px', height: '18px', borderRadius: '50%',
               background: pdfDark ? 'rgba(245,200,66,0.18)' : 'rgba(255,255,255,0.1)',
               transition: 'all 0.25s ease', flexShrink: 0,
             }}>
               {pdfDark ? (
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" />
                 </svg>
               ) : (
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                   <circle cx="12" cy="12" r="5" />
                   <line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" />
                   <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
@@ -1244,7 +1245,7 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
                 </svg>
               )}
             </span>
-            {pdfDark ? 'Dark' : 'Light'}
+            <span className="hidden sm:inline">{pdfDark ? 'Dark' : 'Light'}</span>
           </button>
         </div>
       </div>
@@ -1344,7 +1345,8 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
         >
           <div
             style={{
-              position: 'absolute', right: 0, top: 0, bottom: 0, width: '288px',
+              position: 'absolute', right: 0, top: 0, bottom: 0,
+              width: 'min(288px, 92vw)',
               display: 'flex', flexDirection: 'column',
               background: 'linear-gradient(160deg, #1a1612 0%, #211e18 100%)',
               borderLeft: '1px solid rgba(255,255,255,0.08)',
@@ -1490,8 +1492,8 @@ function PDFReader({ book, onClose, bookmarks, onUpdateBookmarks, session }) {
         <div
           style={{
             position: 'fixed',
-            bottom: '28px',
-            right: '28px',
+            bottom: '20px',
+            right: '16px',
             zIndex: 105,
             display: 'flex',
             flexDirection: 'column',

@@ -1,6 +1,23 @@
 @import "tailwindcss";
 
-/* in index.css */
+/* Base body */
 body {
-    background-image: url("https://www.transparenttextures.com/patterns/paper.png");
+  background-image: url("https://www.transparenttextures.com/patterns/paper.png");
+  /* Prevent horizontal overflow on mobile */
+  overflow-x: hidden;
+}
+
+/* Sticky note drag: allow vertical scroll but handle horizontal for drag */
+[data-page] {
+  touch-action: pan-y;
+}
+
+/* PDF reader scrollable area: enable both axes for pinch-zoom */
+.pdf-scroll-area {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Smooth tap highlights for mobile buttons */
+button {
+  -webkit-tap-highlight-color: transparent;
 }
